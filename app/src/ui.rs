@@ -121,6 +121,9 @@ pub struct App {
     frames: u32,
     shot_requested: bool,
     mv_points: usize,
+    /// which extra layers the M-V interaction plot draws on top of the strength envelope
+    /// (all off by default: only the envelope is shown)
+    mv_show: MvShow,
     /// results from the original program to compare the M-V envelope with (None: offer the
     /// built-in sample-beam readings when the section is the sample beam)
     cases: Option<Vec<CaseRow>>,
@@ -141,6 +144,20 @@ pub struct App {
     lc_text: String,
     lc_rows: Option<Vec<crate::demand::CaseResult>>,
     started: std::time::Instant,
+}
+
+/// Optional layers of the M-V interaction plot; the strength envelope is always drawn.
+#[derive(Clone, Copy, Default)]
+struct MvShow {
+    cracking: bool,
+    long_yield: bool,
+    trans_yield: bool,
+    conc_limit: bool,
+    steel_limit: bool,
+    design: bool,
+    points: bool,
+    checks: bool,
+    shear_peak: bool,
 }
 
 impl App {
@@ -177,6 +194,7 @@ impl App {
             shot_requested: false,
             started: std::time::Instant::now(),
             mv_points: std::env::var("SR_POINTS").ok().and_then(|v| v.parse().ok()).unwrap_or(12),
+            mv_show: MvShow::default(),
             cases: None,
             radial: None,
             biax: None,
@@ -1294,6 +1312,45 @@ impl App {
              the moment held and with the shear held. The orange and teal curves show where the concrete reaches its design \
              strain limit ecu and where a bar reaches its design strain limit (Define > Materials).",
         );
+        // the strength envelope is always drawn; everything else is the user's choice
+        let has_shear = self.shear.is_some();
+        ui.horizontal_wrapped(|ui| {
+            let s = &mut self.mv_show;
+            ui.label("Show:");
+            ui.checkbox(&mut s.cracking, "Cracking");
+            ui.checkbox(&mut s.long_yield, "Longitudinal yield");
+            ui.checkbox(&mut s.trans_yield, "Transverse yield");
+            ui.checkbox(&mut s.conc_limit, "Concrete at ecu");
+            ui.checkbox(&mut s.steel_limit, "Steel at its limit");
+            if dm.is_some() {
+                ui.checkbox(&mut s.design, "Design curve");
+            }
+            ui.checkbox(&mut s.points, "Failure points").on_hover_text("Each envelope point coloured by what failed");
+            if !r.checks.is_empty() {
+                ui.checkbox(&mut s.checks, "Check runs").on_hover_text("Doubtful points re-run with the moment held / the shear held");
+            }
+            if has_shear {
+                ui.checkbox(&mut s.shear_peak, "Shear analysis peak");
+            }
+            ui.separator();
+            if ui.small_button("All").clicked() {
+                *s = MvShow {
+                    cracking: true,
+                    long_yield: true,
+                    trans_yield: true,
+                    conc_limit: true,
+                    steel_limit: true,
+                    design: true,
+                    points: true,
+                    checks: true,
+                    shear_peak: true,
+                };
+            }
+            if ui.small_button("Envelope only").clicked() {
+                *s = MvShow::default();
+            }
+        });
+        let show = self.mv_show;
         if !r.checks.is_empty() {
             egui::CollapsingHeader::new(format!(
                 "Doubtful points checked two other ways ({}: {} agree, {} moved out, {} still disagree)",
@@ -1353,20 +1410,27 @@ impl App {
         let (lim_c, lim_s) = (Color32::from_rgb(230, 120, 0), Color32::from_rgb(0, 140, 140));
         let mut series = vec![];
         let _ = orig_c; // the original's points are compared in the table, not drawn
-        series.extend(vec![
-            Series { width: 1.2, ..Series::line(to(&r.cracking), RED) },
-            Series { width: 1.2, ..Series::line(to(&r.long_yield), green) },
-            Series { width: 1.2, ..Series::line(to(&r.trans_yield), magenta) },
-            Series { width: 2.0, ..Series::line(to(&r.envelope()), BLUE) },
-        ]);
+        if show.cracking {
+            series.push(Series { width: 1.2, ..Series::line(to(&r.cracking), RED) });
+        }
+        if show.long_yield {
+            series.push(Series { width: 1.2, ..Series::line(to(&r.long_yield), green) });
+        }
+        if show.trans_yield {
+            series.push(Series { width: 1.2, ..Series::line(to(&r.trans_yield), magenta) });
+        }
+        series.push(Series { width: 2.0, ..Series::line(to(&r.envelope()), BLUE) });
         let design_red = Color32::BLACK;
+        let dm = if show.design { dm } else { None };
         if let Some(dm) = &dm {
             // ACI 318: (phi(et) M, phi_v V) for each envelope point
             series.push(Series { width: 2.0, ..Series::line(to(&dm.mv(&r.envelope(), n_axial)), design_red) });
         }
-        if let Some((_, s)) = &self.shear {
-            if let Some(p) = s.points.iter().max_by(|a, b| a.v.partial_cmp(&b.v).unwrap()) {
-                series.push(Series { dots: true, ..Series::line(vec![[p.m, p.v]], Color32::BLACK) });
+        if show.shear_peak {
+            if let Some((_, s)) = &self.shear {
+                if let Some(p) = s.points.iter().max_by(|a, b| a.v.partial_cmp(&b.v).unwrap()) {
+                    series.push(Series { dots: true, ..Series::line(vec![[p.m, p.v]], Color32::BLACK) });
+                }
             }
         }
         // the legend sits to the right of the plot, so it never hides the curve
@@ -1376,9 +1440,18 @@ impl App {
         // legend, as in the original
         let lx = if legend_w > 0.0 { rect.max.x - legend_w + 8.0 } else { fr.plot.right() - 290.0 };
         let mut ly = fr.plot.top() + 10.0;
-        let mut legend = vec![("Strength envelope", BLUE), ("Cracking", RED), ("Longitudinal yield", green), ("Transverse yield", magenta)];
-        legend.push(("Concrete at ecu", lim_c));
-        legend.push(("Steel at its limit", lim_s));
+        let mut legend = vec![("Strength envelope", BLUE)];
+        for (on, name, c) in [
+            (show.cracking, "Cracking", RED),
+            (show.long_yield, "Longitudinal yield", green),
+            (show.trans_yield, "Transverse yield", magenta),
+            (show.conc_limit, "Concrete at ecu", lim_c),
+            (show.steel_limit, "Steel at its limit", lim_s),
+        ] {
+            if on {
+                legend.push((name, c));
+            }
+        }
         if dm.is_some() {
             legend.push((if dm.as_ref().map(|m| m.a.code == 1).unwrap_or(false) { "AASHTO LRFD design (φM, φv V)" } else { "ACI 318 design (φM, φv V)" }, design_red));
         }
@@ -1406,7 +1479,7 @@ impl App {
         let clip = painter.with_clip_rect(fr.plot.expand(4.0));
         let mut shown = std::collections::BTreeMap::new();
         let (mut sure, mut unsure, mut inside_n) = (0, 0, 0);
-        for (k, p) in r.points.iter().enumerate() {
+        for (k, p) in r.points.iter().enumerate().filter(|_| show.points) {
             let pos = fr.map(p.0, p.1);
             if r.inside.get(k).copied().unwrap_or(false) {
                 // inside the envelope: its run stopped early (another point carries more of both)
@@ -1433,7 +1506,10 @@ impl App {
         }
         // the design limits: a marker for each run that reached the limit before its peak, joined
         // only to a neighbouring run that reached it too
-        for (pts, col) in [(&r.conc_limit, lim_c), (&r.steel_limit, lim_s)] {
+        for (on, pts, col) in [(show.conc_limit, &r.conc_limit, lim_c), (show.steel_limit, &r.steel_limit, lim_s)] {
+            if !on {
+                continue;
+            }
             let clip = painter.with_clip_rect(fr.plot.expand(2.0));
             for w in pts.windows(2) {
                 if w[0].0.is_finite() && w[1].0.is_finite() {
@@ -1449,7 +1525,7 @@ impl App {
         let xc = Color32::from_rgb(120, 40, 160);
         let tri = |c: Pos2| vec![c + Vec2::new(0.0, -6.0), c + Vec2::new(5.5, 4.0), c + Vec2::new(-5.5, 4.0)];
         let dia = |c: Pos2| vec![c + Vec2::new(0.0, -6.0), c + Vec2::new(6.0, 0.0), c + Vec2::new(0.0, 6.0), c + Vec2::new(-6.0, 0.0)];
-        for c in &r.checks {
+        for c in r.checks.iter().filter(|_| show.checks) {
             let at = fr.map(c.m, c.v);
             let mut shape = |pts: Vec<Pos2>, ok: bool, to: Pos2| {
                 clip.line_segment([at, to], Stroke::new(1.0, xc.gamma_multiply(0.6)));
@@ -1470,19 +1546,25 @@ impl App {
                 shape(dia(p), true, p);
             }
         }
+        // the marker legend lists only the layers that are switched on
+        let show_checks = show.checks && !r.checks.is_empty();
         let mut my = fr.plot.top() + 30.0 + legend_h;
-        let extra = if r.checks.is_empty() { 0.0 } else { 2.0 };
-        let mh = 20.0 * (shown.len() as f32 + 1.0 + extra) + 8.0;
-        painter.rect_filled(Rect::from_min_size(Pos2::new(lx - 8.0, my - 6.0), Vec2::new(300.0, mh)), 0.0, Color32::from_white_alpha(230));
-        for (name, c) in &shown {
-            painter.circle_filled(Pos2::new(lx + 6.0, my + 8.0), 4.0, *c);
-            painter.text(Pos2::new(lx + 18.0, my + 8.0), Align2::LEFT_CENTER, *name, FontId::proportional(12.0), Color32::BLACK);
+        let rows = if show.points { shown.len() as f32 + 1.0 } else { 0.0 } + if show_checks { 2.0 } else { 0.0 };
+        if rows > 0.0 {
+            let mh = 20.0 * rows + 8.0;
+            painter.rect_filled(Rect::from_min_size(Pos2::new(lx - 8.0, my - 6.0), Vec2::new(300.0, mh)), 0.0, Color32::from_white_alpha(230));
+        }
+        if show.points {
+            for (name, c) in &shown {
+                painter.circle_filled(Pos2::new(lx + 6.0, my + 8.0), 4.0, *c);
+                painter.text(Pos2::new(lx + 18.0, my + 8.0), Align2::LEFT_CENTER, *name, FontId::proportional(12.0), Color32::BLACK);
+                my += 20.0;
+            }
+            painter.circle_stroke(Pos2::new(lx + 6.0, my + 8.0), 4.0, Stroke::new(1.6, Color32::GRAY));
+            painter.text(Pos2::new(lx + 18.0, my + 8.0), Align2::LEFT_CENTER, "hollow: solver stop, capacity may be higher", FontId::proportional(12.0), Color32::BLACK);
             my += 20.0;
         }
-        painter.circle_stroke(Pos2::new(lx + 6.0, my + 8.0), 4.0, Stroke::new(1.6, Color32::GRAY));
-        painter.text(Pos2::new(lx + 18.0, my + 8.0), Align2::LEFT_CENTER, "hollow: solver stop, capacity may be higher", FontId::proportional(12.0), Color32::BLACK);
-        if !r.checks.is_empty() {
-            my += 20.0;
+        if show_checks {
             painter.add(egui::Shape::convex_polygon(tri(Pos2::new(lx + 6.0, my + 9.0)), xc, Stroke::NONE));
             painter.text(Pos2::new(lx + 18.0, my + 8.0), Align2::LEFT_CENTER, "check: moment held, shear raised", FontId::proportional(12.0), Color32::BLACK);
             my += 20.0;
@@ -1490,7 +1572,7 @@ impl App {
             painter.text(Pos2::new(lx + 18.0, my + 8.0), Align2::LEFT_CENTER, "check: shear held, moment raised", FontId::proportional(12.0), Color32::BLACK);
         }
         // the counts sit in the legend column, not over the plot
-        if legend_w > 0.0 {
+        if legend_w > 0.0 && show.points {
             painter.text(
                 Pos2::new(lx, fr.plot.bottom() - 4.0),
                 Align2::LEFT_BOTTOM,
