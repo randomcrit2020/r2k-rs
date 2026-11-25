@@ -176,7 +176,7 @@ pub fn evaluate(sec: &Section, cases: &[LoadCase], progress: &(dyn Fn(f32) + Syn
                 let t0 = std::time::Instant::now();
                 let v = shear2d::run(sec, th, n, mv).v;
                 if std::env::var("SR_TIME").is_ok() {
-                    println!("shear job theta {:.1} N {:.0} M/V {:.3}: {:.1} kN in {:.1} s", th, n, mv, v, t0.elapsed().as_secs_f64());
+                    eprintln!("shear job theta {:.1} N {:.0} M/V {:.3}: {:.1} kN in {:.1} s", th, n, mv, v, t0.elapsed().as_secs_f64());
                 }
                 JobOut::Shear(v)
             }

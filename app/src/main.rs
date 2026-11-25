@@ -9,6 +9,7 @@ mod compare;
 mod design;
 mod materials;
 mod mcheck;
+mod mcp;
 mod model;
 mod nine;
 mod path;
@@ -25,6 +26,16 @@ fn main() -> eframe::Result<()> {
     let mut shot: Option<std::path::PathBuf> = None;
     let mut open: Option<std::path::PathBuf> = None;
     let mut solve: Option<String> = None;
+    if args.len() >= 2 && args[1] == "--mcp" {
+        // MCP server on stdin/stdout (mcp.rs), for AI assistants and other MCP clients
+        mcp::serve();
+        return Ok(());
+    }
+    if args.len() >= 2 && args[1] == "--mcp-worker" {
+        // one tool call of the MCP server, in a process of its own (mcp.rs)
+        mcp::worker();
+        return Ok(());
+    }
     if args.len() >= 3 && args[1] == "--report" {
         report(&args[2]);
         return Ok(());
