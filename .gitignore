@@ -7,3 +7,16 @@
 
 # JVM crash logs
 hs_err_pid*.log
+
+# Craft Anything workspace (project state, feed, usage, logs, investigation)
+/craft.json
+/feed.json
+/questions.json
+/usage.json
+/build-activity.log
+/inbox/
+/pinned/
+/investigation.cany/
+/capture/
+/checks/
+/attachments/
