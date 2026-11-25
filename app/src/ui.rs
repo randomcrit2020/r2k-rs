@@ -973,7 +973,7 @@ impl App {
         y += 46.0 * s;
         bold(y, "using the Modified Compression Field Theory", 23.0 * s);
         y += 140.0 * s;
-        txt(y, "Version 0.1", 23.0 * s, dark);
+        txt(y, concat!("Version ", env!("CARGO_PKG_VERSION")), 23.0 * s, dark);
         y += 92.0 * s;
         txt(y, "Define a section with Define > Quick Define,", 22.0 * s, dark);
         y += 37.0 * s;
