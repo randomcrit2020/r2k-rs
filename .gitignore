@@ -2,6 +2,9 @@
 /app/target/
 /app/target-test/
 
+# Reference screenshots (kept locally; the .rsp cases in app/shots/cases stay tracked)
+/app/shots/*.png
+
 # Packaged release downloads (uploaded to GitHub Releases, not committed)
 /dist/
 
