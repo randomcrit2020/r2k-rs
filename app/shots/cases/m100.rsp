@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<!DOCTYPE suite_3g SYSTEM "r3g.dtd">
+
+<document>
+	<r3g_beam	name		="New beam"
+			doneby	=""
+			date		=""	>
+		<concrete	fcp		="40.0"
+				maxagg	="19.0"
+				c_mod		="2"
+				c_soft	="18"
+				t_stiff	="7"
+				name		="Concrete"	/>
+		<rebar		fy		="400.0"
+				fu		="600.0"
+				E		="200000"
+				esh		="15.0"
+				eu		="80.0"
+				name		="Long steel"	/>
+		<prestress	fu		="1860.0"
+				E		="200000"
+				A		="0.025"
+				B		="118.0"
+				C		="10.0"
+				eu		="43.0"
+				name		="P-Steel"	/>
+		<sectionSOLID		>
+					600.0	300.0
+					0.0	300.0	"Concrete"
+			</sectionSOLID>
+		<shapesection	name		="RECT"
+				par1		="300.0"
+				par2		="600.0"	/>
+		<longreinfx	z		="60.00"
+				type		="Long steel"
+				space		="0.0"
+				num		="3"
+				A		="1500.0"
+				bartitle	="25M"
+				dep		="0.00"
+				name		="bottom"	/>
+		<longreinfx	z		="550.00"
+				type		="Long steel"
+				space		="0.0"
+				num		="2"
+				A		="400.0"
+				bartitle	="15M"
+				dep		="0.00"
+				name		="top"	/>
+		<transreinfz	A		="200.0"
+				type		="Long steel"
+				pattern	="2"
+				space		="250.0"
+				disttop	="560.0"
+				distbot	="40.0"
+				bartitle	="10M"
+				db		="11.3"
+				dep		="0.00"
+				name		="stirrups"	/>
+		<sectloading	BN		="0"
+				BM		="100"
+				BV		="0"
+				MN		="0"
+				MM		="0"
+				MV		="1"	/>
+
+	</r3g_beam>
+</document>

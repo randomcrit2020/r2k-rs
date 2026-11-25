@@ -1,0 +1,8 @@
+# Rust build output
+/app/target/
+
+# Builder agent session transcript (contains account IDs)
+/agent-session.jsonl
+
+# JVM crash logs
+hs_err_pid*.log

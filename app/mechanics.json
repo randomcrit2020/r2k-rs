@@ -1,0 +1,923 @@
+{
+  "version": 1,
+  "values": [
+    {
+      "name": "minimum concrete strength",
+      "group": "concrete",
+      "value": 5.0,
+      "unit": "MPa",
+      "source": "function 0x4ac190 (const 0x53b2c0)"
+    },
+    {
+      "name": "cracking strength factor on f'c",
+      "group": "concrete",
+      "value": 0.15,
+      "source": "function 0x4aefa0 (const 0x52f050)",
+      "measured": "ft = 1.960 MPa for f'c 40 (original's printout 1.96)"
+    },
+    {
+      "name": "cracking strength base",
+      "group": "concrete",
+      "value": 1.4,
+      "unit": "MPa",
+      "source": "function 0x4aefa0 (const 0x535ca0)",
+      "measured": "ft = 1.960 MPa for f'c 40 (original's printout 1.96)"
+    },
+    {
+      "name": "cracking strength growth per MPa",
+      "group": "concrete",
+      "value": 0.01,
+      "source": "function 0x4aefa0 (const 0x52f038)",
+      "measured": "ft = 1.960 MPa for f'c 40 (original's printout 1.96)"
+    },
+    {
+      "name": "Ec formula slope",
+      "group": "concrete",
+      "value": 3320,
+      "unit": "sqrt(MPa)",
+      "source": "function 0x4af050 (const 0x53b208)",
+      "measured": "e'c = 2.100 mm/m for f'c 40 (original's printout 2.10)"
+    },
+    {
+      "name": "Ec formula intercept",
+      "group": "concrete",
+      "value": 6900,
+      "unit": "MPa",
+      "source": "function 0x4af050 (const 0x53b210)",
+      "measured": "e'c = 2.100 mm/m for f'c 40 (original's printout 2.10)"
+    },
+    {
+      "name": "Popovics n base",
+      "group": "concrete",
+      "value": 0.8,
+      "source": "function 0x4ad9c0 (const 0x52f068)"
+    },
+    {
+      "name": "Popovics n divisor",
+      "group": "concrete",
+      "value": 17,
+      "unit": "MPa",
+      "source": "function 0x4ad9c0 (const 0x53b1e8)"
+    },
+    {
+      "name": "Popovics n minimum",
+      "group": "concrete",
+      "value": 1.1,
+      "source": "function 0x4ad9c0 (const 0x52f5e8)"
+    },
+    {
+      "name": "post-peak k base",
+      "group": "concrete",
+      "value": 0.67,
+      "source": "function 0x4ad9c0 (const 0x53b1c8)"
+    },
+    {
+      "name": "post-peak k divisor",
+      "group": "concrete",
+      "value": 62,
+      "unit": "MPa",
+      "source": "function 0x4ad9c0 (const 0x530940)"
+    },
+    {
+      "name": "Ec secant strain",
+      "group": "concrete",
+      "value": 0.0001,
+      "source": "function 0x4ac190 (const 0x53b2e0)"
+    },
+    {
+      "name": "softening base",
+      "group": "concrete",
+      "value": 0.8,
+      "source": "function 0x4ad9c0 case 18"
+    },
+    {
+      "name": "softening slope minimum",
+      "group": "concrete",
+      "value": 170,
+      "source": "function 0x4ad9c0 case 18 (const 0x53b200)"
+    },
+    {
+      "name": "softening slope per MPa",
+      "group": "concrete",
+      "value": 3,
+      "source": "function 0x4ad9c0 case 18 (const 0x52e030)"
+    },
+    {
+      "name": "VC1986 softening slope",
+      "group": "concrete",
+      "value": 0.34,
+      "source": "function 0x4ad9c0 case 2 (const 0x53b1a8)"
+    },
+    {
+      "name": "cracking stress under compression: constant",
+      "group": "concrete",
+      "value": 1.05,
+      "source": "function 0x46a960 (const 0x52f5e0), factor clamp(1.05 - f2/fp, 0.05, 1), on by default (flag 0x569f58 set in 0x4b2580)",
+      "measured": "factor 0.220 at f2/fp = 0.83 (original's plot 0.42 MPa = 0.22 ft); web cracking at N = -6000 kN 513.1 kN (original 516.3)"
+    },
+    {
+      "name": "cracking stress under compression: floor",
+      "group": "concrete",
+      "value": 0.05,
+      "source": "function 0x46a960 (const 0x52f040)",
+      "measured": "factor 0.050 at f2/fp = 1.2"
+    },
+    {
+      "name": "stress across a crack after cracking: ft' / (1 + k w)",
+      "group": "concrete",
+      "value": 250,
+      "unit": "per mm of crack width",
+      "source": "function 0x4ac920 (const 0x53b220 = 250000 per m)"
+    },
+    {
+      "name": "post-cracking branch under compression",
+      "group": "concrete",
+      "value": "tension curve scaled by the cracking factor",
+      "estimated": true
+    },
+    {
+      "name": "tension stiffening bond constant",
+      "group": "concrete",
+      "value": 3600,
+      "unit": "k = 3600 / (sum of bar perimeter per concrete area, 1/m)",
+      "source": "constant 0x5464e0 in functions 0x4fec60 (x, longitudinal bars) and 0x4ff1a0 (z, stirrups); k = min(kx, kz) per layer at 0x4a94d0"
+    },
+    {
+      "name": "longitudinal reserve at a crack: zone stress limits",
+      "group": "concrete",
+      "value": "uniform up to 0.6 ft, front at most 3 ft, 3 ft between the fronts (off by default, SR_LONG_RESERVE=1)",
+      "source": "functions 0x441d80 and 0x440400 (constants 0x52f058 = 0.6, 0x52e030 = 3); crack check 0x46aaa0 f1 <= rx + vci/tan theta"
+    },
+    {
+      "name": "strain concentration at a crack for the bars' reserve",
+      "group": "concrete",
+      "value": "e_crack = max(1, 0.014/rho) e + (esh - ey)",
+      "source": "functions 0x4ac830 / 0x4ae520 (constant 0x53b180 = 0.014; 0.625 for strand)"
+    },
+    {
+      "name": "bar ratio for the strain at a crack, beam sections",
+      "group": "concrete",
+      "value": "bar area on the bar's side of the centre / (0.8 Ag)",
+      "source": "function 0x4bc470 (constant 0x52f068 = 0.8; Ag at +0x816 per 0x4bb270)"
+    },
+    {
+      "name": "type-7 lower bound on cracked concrete tension",
+      "group": "concrete",
+      "value": "min(rx/2, 0.85 ft tan theta + rz, ts min(0.25 ft/(0.31 + 24 w/(a+16))/tan theta, ft'))",
+      "source": "function 0x46aaa0 (constants 0x52e5a0 = 0.25, 0x52e5d0 = 0.85); only with SR_LONG_RESERVE=full"
+    },
+    {
+      "name": "Quick Define: bars per row",
+      "group": "section creator",
+      "value": "floor(((b - 2 cover - 2 db_stirrup)/db + 1)/2), rows 2 db apart, first centre at cover + db_stirrup + db/2",
+      "source": "functions 0x475cf0 / 0x476710; matches the original's saved files shots/cases/quick-*.rsp (--check-quick: 0 mismatches)"
+    },
+    {
+      "name": "Quick Define: steel strain hardening start / rupture",
+      "group": "section creator",
+      "value": "7 / 100",
+      "unit": "mm/m",
+      "source": "the original's saved Quick Define files (shots/cases/quick-default.rsp)"
+    },
+    {
+      "name": "Quick Define: strand row pitch",
+      "group": "section creator",
+      "value": 50.8,
+      "unit": "mm",
+      "source": "constant 0x533798 in function 0x4764a0; matches shots/cases/quick-tee.rsp"
+    },
+    {
+      "name": "floor across a crack, applied after the crack check",
+      "group": "concrete",
+      "value": "ft' / (1 + 250 w), w in mm (opt-in SR_FLOOR_LAST=1; default applies it only under compression, before the cap)",
+      "source": "functions 0x4ac920 (constant 0x53b220 = 250000 per m) and 0x46aaa0 (last step)"
+    },
+    {
+      "name": "stirrup reserve spacing factor at a crack",
+      "group": "concrete",
+      "value": "k = clamp(0.5 (3 - s/h), 0, 1)",
+      "source": "function 0x4a80e0 (layer +0x10c, used by the crack check 0x46aaa0 as f1 <= k rho_z (fy - fs) + vci tan theta)"
+    },
+    {
+      "name": "bond zone around longitudinal bars",
+      "group": "concrete",
+      "value": 7.5,
+      "unit": "bar diameters each side",
+      "source": "constant 0x5321e8 in function 0x4fec60"
+    },
+    {
+      "name": "bond triangle peak factor",
+      "group": "concrete",
+      "value": 2.5,
+      "source": "constant 0x531ef8 in function 0x4fec60 (triangle over +- the crack spacing at the bars)"
+    },
+    {
+      "name": "lateral bar spacing when a layer gives none",
+      "group": "concrete",
+      "value": 100,
+      "unit": "mm",
+      "source": "function 0x4fc640 (constant 0x52f048 = 0.1 m); crack spacing sqrt(4 d^2 + sb^2) at 0x43faf0"
+    },
+    {
+      "name": "measured: bond parameter at the bottom bars of the sample beam",
+      "group": "measured against the original",
+      "value": 136.0,
+      "unit": "mm",
+      "source": "this build, --report with SR_BOND=1 (web 1061 mm from stirrups, top bars 210 mm)"
+    },
+    {
+      "name": "axial tension capacity in the interaction diagrams",
+      "group": "interaction",
+      "value": "largest axial load before the first strain hardening of the bars (peak at yield)",
+      "source": "function 0x41dc80: the interaction ends are load-stepping sectional runs with an axial increment only (0x500260/0x5002d0 set it, solver 0x415540); the load falls along the yield plateau, so the run ends at the yield peak (original 886.3 kN, shots/orig-mn.png)"
+    },
+    {
+      "name": "measured: mean difference of the 14 runs against the original after the bond rule",
+      "group": "measured against the original",
+      "value": 5.01,
+      "unit": "%",
+      "source": "--check-mechanics, mechanics-check.json (was 5.86 % with the estimated bond)"
+    },
+    {
+      "name": "design limit ecu (designer's choice, marked on plots only)",
+      "group": "concrete",
+      "value": 3.5,
+      "unit": "mm/m",
+      "estimated": true
+    },
+    {
+      "name": "crack shear coefficient",
+      "group": "crack check",
+      "value": 0.18,
+      "source": "function 0x46aaa0 (const 0x5334d8)",
+      "measured": "vci,max(w = 0) = 3.672 MPa for f'c 40 (original's plot label 3.67)"
+    },
+    {
+      "name": "crack shear denominator",
+      "group": "crack check",
+      "value": 0.31,
+      "source": "function 0x46aaa0 (const 0x5334e0)",
+      "measured": "vci,max(w = 0) = 3.672 MPa (original 3.67)"
+    },
+    {
+      "name": "crack width factor",
+      "group": "crack check",
+      "value": 24,
+      "source": "function 0x46aaa0 (const 0x530910)"
+    },
+    {
+      "name": "aggregate offset",
+      "group": "crack check",
+      "value": 16,
+      "unit": "mm",
+      "source": "function 0x46aaa0 (const 0x5334d0)"
+    },
+    {
+      "name": "aggregate reduction start",
+      "group": "crack check",
+      "value": 60,
+      "unit": "MPa",
+      "source": "function 0x4ac000"
+    },
+    {
+      "name": "aggregate reduction end",
+      "group": "crack check",
+      "value": 70,
+      "unit": "MPa",
+      "source": "function 0x4ac000"
+    },
+    {
+      "name": "aggregate cap",
+      "group": "crack check",
+      "value": 25,
+      "unit": "mm",
+      "source": "function 0x4ac000 (const 0x5321e0)"
+    },
+    {
+      "name": "shear on crack: governing direction",
+      "group": "crack check",
+      "value": "the direction (longitudinal or transverse steel) with the smaller reserve rho (fy - fs)",
+      "source": "function 0x46aaa0; tan(theta) kept within 1e-6..1e6 (0x52e570, 0x52e680)"
+    },
+    {
+      "name": "longitudinal crack spacing",
+      "group": "crack check",
+      "value": "gap between bar layers, 100 mm to 0.9 h",
+      "estimated": true
+    },
+    {
+      "name": "shear-flow cap on a layer",
+      "group": "shear flow",
+      "value": 8.0,
+      "unit": "x average shear stress",
+      "source": "function 0x41e840 (const 0x5308f8); the average's divisor not identified (taken as V over the concrete area)"
+    },
+    {
+      "name": "shear-flow blend with the previous iteration",
+      "group": "shear flow",
+      "value": 0.5,
+      "source": "function 0x41e840 (const 0x52e5b8); this build blends 0.6 of the new value"
+    },
+    {
+      "name": "shear-flow change limit per iteration",
+      "group": "shear flow",
+      "value": 10,
+      "unit": "x",
+      "source": "function 0x41e840 (100 x for a material named steel)"
+    },
+    {
+      "name": "steel modulus default",
+      "group": "steel",
+      "value": 200000,
+      "unit": "MPa",
+      "source": "DTD text at 0x5373f8"
+    },
+    {
+      "name": "steel fu default",
+      "group": "steel",
+      "value": 600,
+      "unit": "MPa",
+      "source": "DTD text at 0x5373f8"
+    },
+    {
+      "name": "steel strain hardening start default",
+      "group": "steel",
+      "value": 15,
+      "unit": "mm/m",
+      "source": "DTD text at 0x5373f8",
+      "measured": "moment-curvature leaves the yield plateau at 322.3 kNm, where the bars reach 15 mm/m"
+    },
+    {
+      "name": "steel rupture strain default",
+      "group": "steel",
+      "value": 80,
+      "unit": "mm/m",
+      "source": "DTD text at 0x5373f8"
+    },
+    {
+      "name": "strain hardening curve",
+      "group": "steel",
+      "value": "parabola with vertex at (eu, fu)",
+      "source": "function 0x4aea40"
+    },
+    {
+      "name": "prestress Ramberg-Osgood A default",
+      "group": "prestress",
+      "value": 0.025,
+      "source": "DTD text at 0x5373f8"
+    },
+    {
+      "name": "prestress Ramberg-Osgood B default",
+      "group": "prestress",
+      "value": 118,
+      "source": "DTD text at 0x5373f8"
+    },
+    {
+      "name": "prestress Ramberg-Osgood C default",
+      "group": "prestress",
+      "value": 10,
+      "source": "DTD text at 0x5373f8"
+    },
+    {
+      "name": "prestress rupture strain default",
+      "group": "prestress",
+      "value": 43,
+      "unit": "mm/m",
+      "source": "DTD text at 0x5373f8"
+    },
+    {
+      "name": "loads: constant + load factor x increment",
+      "group": "loads",
+      "value": "N = BN + f MN, M = BM + f MM, V = BV + f MV",
+      "source": "function 0x406470 (N_u, M_u, V_u); DTD defaults BN = BM = BV = MN = MV = 0, MM = 1 at 0x538f59"
+    },
+    {
+      "name": "interaction diagrams: centre of the runs",
+      "group": "interaction",
+      "value": 0.25,
+      "source": "function 0x413e60 (const 0x52e5a0): mean of four extreme results; runs at angle 2 pi k / n from it (pi at 0x52e600)"
+    },
+    {
+      "name": "concrete layers (bending / shear)",
+      "group": "analysis",
+      "value": "80 / 40, shear runs re-meshed at 60, 30 and 80 when they stop without failure proof",
+      "estimated": true
+    },
+    {
+      "name": "concrete strain limit for moment-curvature",
+      "group": "analysis",
+      "value": -0.012,
+      "estimated": true
+    },
+    {
+      "name": "measured: sectional response, shear only (M/V = 0) (original 319.3 kN)",
+      "group": "measured against the original",
+      "value": 315.0,
+      "unit": "kN",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-mv0.png; difference -1.4 %"
+    },
+    {
+      "name": "measured: sectional response, M/V = 0.6 m (original 301.8 kN)",
+      "group": "measured against the original",
+      "value": 329.1,
+      "unit": "kN",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-mv06.png; difference 9.1 %"
+    },
+    {
+      "name": "measured: sectional response, M/V = 1.5 m (original 203.1 kN)",
+      "group": "measured against the original",
+      "value": 192.8,
+      "unit": "kN",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-mv15.png; difference -5.1 %"
+    },
+    {
+      "name": "measured: sectional response, M/V = 4 m (original 87.4 kN)",
+      "group": "measured against the original",
+      "value": 81.8,
+      "unit": "kN",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-mv4.png; difference -6.4 %"
+    },
+    {
+      "name": "measured: constant moment 100 kNm, shear raised (original 387.9 kN)",
+      "group": "measured against the original",
+      "value": 353.9,
+      "unit": "kN",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-m100.png; difference -8.8 %"
+    },
+    {
+      "name": "measured: constant shear 100 kN, moment raised (original 328.1 kNm)",
+      "group": "measured against the original",
+      "value": 327.3,
+      "unit": "kNm",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-v100.png; difference -0.2 %"
+    },
+    {
+      "name": "measured: moment only (original 356.4 kNm)",
+      "group": "measured against the original",
+      "value": 361.7,
+      "unit": "kNm",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-monly.png; difference 1.5 %"
+    },
+    {
+      "name": "measured: shear capacity at constant N = -6000 kN (original 772.6 kN)",
+      "group": "measured against the original",
+      "value": 743.8,
+      "unit": "kN",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-n6000.png; difference -3.7 %"
+    },
+    {
+      "name": "measured: web cracking at constant N = -6000 kN (original 516.3 kN)",
+      "group": "measured against the original",
+      "value": 513.1,
+      "unit": "kN",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-n6000-kink.png; difference -0.6 %"
+    },
+    {
+      "name": "measured: M-N largest positive moment (original 642 kNm)",
+      "group": "measured against the original",
+      "value": 642.2,
+      "unit": "kNm",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-mn.png; difference 0.0 %"
+    },
+    {
+      "name": "measured: M-N largest negative moment (original -652.3 kNm)",
+      "group": "measured against the original",
+      "value": -650.5,
+      "unit": "kNm",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-mn.png; difference -0.3 %"
+    },
+    {
+      "name": "measured: M-N pure compression (original -7794.5 kN)",
+      "group": "measured against the original",
+      "value": -7883.8,
+      "unit": "kN",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-mn.png; difference 1.1 %"
+    },
+    {
+      "name": "measured: M-N pure tension (original 886.3 kN)",
+      "group": "measured against the original",
+      "value": 878.4,
+      "unit": "kN",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-mn.png; difference -0.9 %; the end is the load peak as the bars yield, as the original's load-stepping axial run stops there"
+    },
+    {
+      "name": "measured: bending capacity (moment-curvature, N = 0) (original 356.4 kNm)",
+      "group": "measured against the original",
+      "value": 355.7,
+      "unit": "kNm",
+      "source": "run time, section-response --check-mechanics (mechanics-check.json); original: shots/orig-monly.png; difference -0.2 %"
+    },
+    {
+      "name": "material factor phi_c, default",
+      "group": "material factors",
+      "value": 1.0,
+      "unit": "",
+      "source": "global 0x569f00 set at start-up by 0x4992b0 (const 0x5329c0)"
+    },
+    {
+      "name": "material factor phi_c, CSA preset",
+      "group": "material factors",
+      "value": 0.65,
+      "unit": "",
+      "source": "Options > General dialog (RT_DIALOG 320), handlers 0x46f920 (CSA) / 0x46f970 (None) / 0x46fa90 (OK), string 0x534f24"
+    },
+    {
+      "name": "material factor phi_s, CSA preset",
+      "group": "material factors",
+      "value": 0.85,
+      "unit": "",
+      "source": "Options > General dialog (RT_DIALOG 320), handlers 0x46f920 (CSA) / 0x46f970 (None) / 0x46fa90 (OK), string 0x534f2c"
+    },
+    {
+      "name": "material factor phi_p, CSA preset",
+      "group": "material factors",
+      "value": 0.9,
+      "unit": "",
+      "source": "Options > General dialog (RT_DIALOG 320), handlers 0x46f920 (CSA) / 0x46f970 (None) / 0x46fa90 (OK), string 0x534f34"
+    },
+    {
+      "name": "material factor lower limit",
+      "group": "material factors",
+      "value": 0.01,
+      "unit": "",
+      "source": "0x46fa90 clamp, const 0x52f038"
+    },
+    {
+      "name": "material factor upper limit",
+      "group": "material factors",
+      "value": 10.0,
+      "unit": "",
+      "source": "0x46fa90 clamp, const 0x52e608"
+    },
+    {
+      "name": "factored-run test tolerance on phic+phis+phip-3",
+      "group": "material factors",
+      "value": 0.001,
+      "unit": "",
+      "source": "consts 0x52e028 (0.001), 0x52e030 (3.0)"
+    },
+    {
+      "name": "steel stronger than this uses phi_p (prestressing)",
+      "group": "material factors",
+      "value": 750.0,
+      "unit": "MPa",
+      "source": "0x4ac800, const 0x5311f8 (750e6 Pa)"
+    },
+    {
+      "name": "measured: factored bending capacity, CSA factors (original 258.2 kNm)",
+      "group": "measured against the original",
+      "value": 258.1,
+      "unit": "kNm",
+      "source": "shots/orig-monly-csa.png; section-response --check-mechanics"
+    },
+    {
+      "name": "measured: factored shear at M/V 1.5 m, CSA factors (original 157.9 kN)",
+      "group": "measured against the original",
+      "value": 154.8,
+      "unit": "kN",
+      "source": "shots/orig-mv15-csa.png; section-response --check-mechanics"
+    },
+    {
+      "name": "ACI 318 phi, tension-controlled",
+      "group": "ACI 318 strength reduction",
+      "value": 0.9,
+      "unit": "",
+      "source": "ACI 318-19 Table 21.2.2"
+    },
+    {
+      "name": "ACI 318 phi, compression-controlled, ties",
+      "group": "ACI 318 strength reduction",
+      "value": 0.65,
+      "unit": "",
+      "source": "ACI 318-19 Table 21.2.2"
+    },
+    {
+      "name": "ACI 318 phi, compression-controlled, spiral",
+      "group": "ACI 318 strength reduction",
+      "value": 0.75,
+      "unit": "",
+      "source": "ACI 318-19 Table 21.2.2"
+    },
+    {
+      "name": "ACI 318 phi, shear",
+      "group": "ACI 318 strength reduction",
+      "value": 0.75,
+      "unit": "",
+      "source": "ACI 318-19 Table 21.2.1"
+    },
+    {
+      "name": "ACI 318 concrete strain at nominal strength",
+      "group": "ACI 318 strength reduction",
+      "value": 3.0,
+      "unit": "mm/m",
+      "source": "ACI 318-19 22.2.2.1"
+    },
+    {
+      "name": "ACI 318 tension-controlled limit beyond ety",
+      "group": "ACI 318 strength reduction",
+      "value": 3.0,
+      "unit": "mm/m",
+      "source": "ACI 318-19 Table 21.2.2"
+    },
+    {
+      "name": "ACI 318 yield strain for prestressing steel",
+      "group": "ACI 318 strength reduction",
+      "value": 2.0,
+      "unit": "mm/m",
+      "source": "ACI 318-19 21.2.2.1"
+    },
+    {
+      "name": "ACI 318 Pn,max / P0, ties",
+      "group": "ACI 318 strength reduction",
+      "value": 0.8,
+      "unit": "",
+      "source": "ACI 318-19 Table 22.4.2.1"
+    },
+    {
+      "name": "ACI 318 Pn,max / P0, spiral",
+      "group": "ACI 318 strength reduction",
+      "value": 0.85,
+      "unit": "",
+      "source": "ACI 318-19 Table 22.4.2.1"
+    },
+    {
+      "name": "ACI 318 concrete stress in P0",
+      "group": "ACI 318 strength reduction",
+      "value": 0.85,
+      "unit": "x f'c",
+      "source": "ACI 318-19 22.4.2.2"
+    },
+    {
+      "name": "measured: ACI 318 net tensile strain at N = 0, sample beam (hand stress block 18.05 mm/m)",
+      "group": "measured against hand calculation",
+      "value": 18.7,
+      "unit": "mm/m",
+      "source": "section-response --check-mechanics (plane sections, compression bars included)"
+    },
+    {
+      "name": "measured: ACI 318 squash load P0, sample beam (hand 6815.4 kN)",
+      "group": "measured against hand calculation",
+      "value": 6815.4,
+      "unit": "kN",
+      "source": "section-response --check-mechanics"
+    },
+    {
+      "name": "strand factor on the crack-strain magnification",
+      "group": "rupture at a crack",
+      "value": 0.625,
+      "unit": "",
+      "source": "0x4ac830, const 0x53b1b8 (bar titles starting with S or T)"
+    },
+    {
+      "name": "crack-strain magnification constant",
+      "group": "rupture at a crack",
+      "value": 0.014,
+      "unit": "",
+      "source": "0x4ac830, const 0x53b180: x = max(1, k 0.014 / rho)"
+    },
+    {
+      "name": "crack-strain magnification when rho is 0",
+      "group": "rupture at a crack",
+      "value": 2.0,
+      "unit": "",
+      "source": "0x4ac830, const 0x52e5f8"
+    },
+    {
+      "name": "strand yield stress for the crack check",
+      "group": "rupture at a crack",
+      "value": 0.9,
+      "unit": "x fpu",
+      "source": "0x4ab4e0, const 0x52e5d8"
+    },
+    {
+      "name": "measured: strands-only T-beam, moment only (original 388.9 kNm)",
+      "group": "measured against the original",
+      "value": 389.6,
+      "unit": "kNm",
+      "source": "shots/orig-pt-tee-monly.png; section-response --check-mechanics"
+    },
+    {
+      "name": "measured: strands-only T-beam, M/V 1.5 m (original 242.6 kN)",
+      "group": "measured against the original",
+      "value": 243.5,
+      "unit": "kN",
+      "source": "shots/orig-pt-tee-mv15.png; section-response --check-mechanics"
+    },
+    {
+      "name": "measured: T-beam with strands and bars, moment only (original 987.0 kNm)",
+      "group": "measured against the original",
+      "value": 992.9,
+      "unit": "kNm",
+      "source": "shots/orig-quick-tee-monly.png; section-response --check-mechanics"
+    },
+    {
+      "name": "measured: T-beam with strands and bars, M/V 1.5 m (original 450.0 kN)",
+      "group": "measured against the original",
+      "value": 420.5,
+      "unit": "kN",
+      "source": "shots/orig-quick-tee-mv15.png; section-response --check-mechanics"
+    },
+    {
+      "name": "biaxial: concrete strips across each layer",
+      "group": "biaxial bending (this program's addition)",
+      "value": 24,
+      "unit": "",
+      "source": "estimated (this rebuild): fibre mesh 80 layers x 24 strips"
+    },
+    {
+      "name": "biaxial: curvature step ratio",
+      "group": "biaxial bending (this program's addition)",
+      "value": 1.03,
+      "unit": "",
+      "source": "estimated (this rebuild)"
+    },
+    {
+      "name": "biaxial: stop at the most compressed fibre",
+      "group": "biaxial bending (this program's addition)",
+      "value": -12.0,
+      "unit": "mm/m",
+      "source": "the same stop as this program's moment-curvature run (analysis::moment_curvature)"
+    },
+    {
+      "name": "measured: biaxial at angle 0 vs one-axis, sample beam N = 0 (one-axis 355.7 kNm)",
+      "group": "measured against this program's one-axis run",
+      "value": 355.8,
+      "unit": "kNm",
+      "source": "section-response --check-mechanics"
+    },
+    {
+      "name": "measured: biaxial at angle 0 vs one-axis, sample beam N = -3000 kN (one-axis 607.6 kNm)",
+      "group": "measured against this program's one-axis run",
+      "value": 607.6,
+      "unit": "kNm",
+      "source": "section-response --check-mechanics"
+    },
+    {
+      "name": "measured: symmetric column 600 x 600, 16 x 30M, N = -2000 kN, at 90 deg (at 0 deg 1388.6 kNm)",
+      "group": "measured against symmetry",
+      "value": 1388.2,
+      "unit": "kNm",
+      "source": "section-response --check-mechanics"
+    },
+    {
+      "name": "shear in two directions: outline levels of the turned section",
+      "group": "shear in two directions (this program's addition)",
+      "value": 160,
+      "unit": "",
+      "source": "estimated (this rebuild)"
+    },
+    {
+      "name": "ACI 318 shear in two directions: ratio below which a direction is checked alone",
+      "group": "shear in two directions (this program's addition)",
+      "value": 0.5,
+      "unit": "",
+      "source": "ACI 318-19 rule for shear in two directions (clause to be confirmed by the user)"
+    },
+    {
+      "name": "ACI 318 shear in two directions: limit on the sum of the two ratios",
+      "group": "shear in two directions (this program's addition)",
+      "value": 1.5,
+      "unit": "",
+      "source": "ACI 318-19 rule for shear in two directions (clause to be confirmed by the user)"
+    },
+    {
+      "name": "measured: two-direction shear at 0 deg vs one-direction run, sample beam M/V 1.5 m (one-direction 192.8 kN)",
+      "group": "measured against this program's one-direction run",
+      "value": 192.8,
+      "unit": "kN",
+      "source": "section-response --check-mechanics"
+    },
+    {
+      "name": "measured: square column 600 x 600, 16 x 30M, shear only, at 90 deg (at 0 deg 508.2 kN)",
+      "group": "measured against symmetry",
+      "value": 514.0,
+      "unit": "kN",
+      "source": "section-response --check-mechanics"
+    },
+    {
+      "name": "AASHTO phi, tension-controlled reinforced",
+      "group": "AASHTO LRFD resistance factors",
+      "value": 0.9,
+      "unit": "",
+      "source": "AASHTO LRFD 9th ed. 5.5.4.2"
+    },
+    {
+      "name": "AASHTO phi, tension-controlled prestressed",
+      "group": "AASHTO LRFD resistance factors",
+      "value": 1.0,
+      "unit": "",
+      "source": "AASHTO LRFD 9th ed. 5.5.4.2"
+    },
+    {
+      "name": "AASHTO phi, compression-controlled (ties or spirals)",
+      "group": "AASHTO LRFD resistance factors",
+      "value": 0.75,
+      "unit": "",
+      "source": "AASHTO LRFD 9th ed. 5.5.4.2"
+    },
+    {
+      "name": "AASHTO phi, shear and torsion (normal weight)",
+      "group": "AASHTO LRFD resistance factors",
+      "value": 0.9,
+      "unit": "",
+      "source": "AASHTO LRFD 9th ed. 5.5.4.2"
+    },
+    {
+      "name": "AASHTO tension-controlled strain limit, bars to 517 MPa and strands",
+      "group": "AASHTO LRFD resistance factors",
+      "value": 5.0,
+      "unit": "mm/m",
+      "source": "AASHTO LRFD 5.6.2.1"
+    },
+    {
+      "name": "AASHTO tension-controlled strain limit, 690 MPa bars",
+      "group": "AASHTO LRFD resistance factors",
+      "value": 8.0,
+      "unit": "mm/m",
+      "source": "AASHTO LRFD 5.6.2.1"
+    },
+    {
+      "name": "ACI phi, torsion",
+      "group": "torsion (ACI 318 / AASHTO LRFD)",
+      "value": 0.75,
+      "unit": "",
+      "source": "ACI 318-19 Table 21.2.1"
+    },
+    {
+      "name": "ACI threshold torsion coefficient",
+      "group": "torsion (ACI 318 / AASHTO LRFD)",
+      "value": 0.083,
+      "unit": "sqrt(MPa)",
+      "source": "ACI 318-19 Table 22.7.4.1(a)"
+    },
+    {
+      "name": "ACI/AASHTO Ao / Aoh",
+      "group": "torsion (ACI 318 / AASHTO LRFD)",
+      "value": 0.85,
+      "unit": "",
+      "source": "ACI 318-19 22.7.6.1.1; AASHTO LRFD C5.7.3.6.2"
+    },
+    {
+      "name": "ACI torsion fyt limit",
+      "group": "torsion (ACI 318 / AASHTO LRFD)",
+      "value": 420.0,
+      "unit": "MPa",
+      "source": "ACI 318-19 20.2.2.4"
+    },
+    {
+      "name": "ACI shear-torsion limit term",
+      "group": "torsion (ACI 318 / AASHTO LRFD)",
+      "value": 0.66,
+      "unit": "sqrt(MPa)",
+      "source": "ACI 318-19 22.7.7.1(a)"
+    },
+    {
+      "name": "ACI Vc coefficient with minimum shear reinforcement",
+      "group": "torsion (ACI 318 / AASHTO LRFD)",
+      "value": 0.17,
+      "unit": "sqrt(MPa)",
+      "source": "ACI 318-19 Table 22.5.5.1"
+    },
+    {
+      "name": "AASHTO cracking torque coefficient (0.126 ksi form)",
+      "group": "torsion (ACI 318 / AASHTO LRFD)",
+      "value": 0.331,
+      "unit": "sqrt(MPa)",
+      "source": "AASHTO LRFD 5.7.2.1-4"
+    },
+    {
+      "name": "AASHTO torsion neglected below this share of phi Tcr",
+      "group": "torsion (ACI 318 / AASHTO LRFD)",
+      "value": 0.25,
+      "unit": "",
+      "source": "AASHTO LRFD 5.7.2.1-3"
+    },
+    {
+      "name": "AASHTO effective-shear factor on the torsion term",
+      "group": "torsion (ACI 318 / AASHTO LRFD)",
+      "value": 0.9,
+      "unit": "",
+      "source": "AASHTO LRFD 5.7.2.1-6"
+    },
+    {
+      "name": "measured: ACI phi Tn, 600 x 600 column (hand 43.99 kNm)",
+      "group": "measured against hand calculation",
+      "value": 43.99,
+      "unit": "kNm",
+      "source": "section-response --check-mechanics"
+    },
+    {
+      "name": "measured: AASHTO phi Tn, same column (hand 52.79 kNm)",
+      "group": "measured against hand calculation",
+      "value": 52.79,
+      "unit": "kNm",
+      "source": "section-response --check-mechanics"
+    },
+    {
+      "name": "run-time check of this build",
+      "group": "measured against the original",
+      "value": "22 of 22 constants within tolerance (6 against the original, 11 code hand checks for ACI 318, AASHTO LRFD and torsion, 5 self-checks of biaxial bending and shear); 20 of 20 runs within tolerance (4 prestressed T-beams, 2 factored with the CSA factors); mean difference from the original 2.45 %",
+      "source": "section-response --check-mechanics mechanics-check.json, 2026-11-21"
+    }
+  ]
+}
