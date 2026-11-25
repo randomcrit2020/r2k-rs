@@ -459,6 +459,251 @@ fn lu_solve(a: &mut [f64], n: usize, b: &mut [f64]) -> bool {
     true
 }
 
+/// The damped normal equations (A + mu diag(A)) d = g of the LM corrector, A = J^T J + w w^T,
+/// kept in the structure the section system gives them instead of as a dense matrix.
+///
+/// Each layer's two rows (shear share, transverse balance) touch only that layer's own two
+/// unknowns (gamma_i, ez_i) and the three shared ones (ec, phi, load); only the axial-force row,
+/// the moment row and the step's constraint row are full. So A = S + U U^T, where S (the layer
+/// rows) is a 2 x 2 block per layer bordered by the three shared unknowns and U holds the three
+/// full rows. With s = U^T d as three extra unknowns the system
+///     [S  U] [d]   [g]
+///     [U' -I] [s] = [0]
+/// has the same block-and-border form, now with six border unknowns: every layer block is
+/// eliminated on its own and a 6 x 6 system is left. The answer is the dense solve's (to
+/// rounding), at a cost that grows with the number of layers instead of its cube.
+struct NormalEq {
+    nl: usize,
+    nu: usize,
+    /// diagonal of the full A (the damping is scaled by it, as in the dense solve)
+    diag: Vec<f64>,
+    /// per layer, the layer rows' part of A on (gamma_i, ez_i): (gg, gz, zz)
+    k: Vec<[f64; 3]>,
+    /// per layer, the layer rows' part of A between (gamma_i, ez_i) and (ec, phi, load)
+    c: Vec<[[f64; 3]; 2]>,
+    /// the layer rows' part of A on (ec, phi, load)
+    e: [[f64; 3]; 3],
+    /// the three full rows: axial force, moment, constraint
+    u: [Vec<f64>; 3],
+    /// right-hand side J^T r + w (w.d - target)
+    g: Vec<f64>,
+}
+
+impl NormalEq {
+    /// From the slope matrix j (nr x nu, nr = 2 nl + 2), the residuals r and the weighted
+    /// constraint row and its right-hand side. None when a layer row reaches outside its own
+    /// unknowns and the shared ones (the dense solve is used then).
+    fn build(j: &[f64], r: &[f64], wrow: &[f64], wrhs: f64, nl: usize) -> Option<NormalEq> {
+        let nu = 2 * nl + 3;
+        let nr = 2 * nl + 2;
+        if j.len() != nr * nu || r.len() != nr || wrow.len() != nu {
+            return None;
+        }
+        let border = [0, 1, nu - 1];
+        let mut ne = NormalEq {
+            nl,
+            nu,
+            diag: vec![0.0; nu],
+            k: vec![[0.0; 3]; nl],
+            c: vec![[[0.0; 3]; 2]; nl],
+            e: [[0.0; 3]; 3],
+            u: [j[..nu].to_vec(), j[nu..2 * nu].to_vec(), wrow.to_vec()],
+            g: vec![0.0; nu],
+        };
+        let rhs_full = [r[0], r[1], wrhs];
+        for (k, row) in ne.u.iter().enumerate() {
+            for (col, v) in row.iter().enumerate() {
+                ne.g[col] += v * rhs_full[k];
+                ne.diag[col] += v * v;
+            }
+        }
+        for rr in 2..nr {
+            let i = (rr - 2) % nl;
+            let (cg, cz) = (2 + i, 2 + nl + i);
+            let row = &j[rr * nu..(rr + 1) * nu];
+            // a layer row must be zero outside its five columns
+            for (col, v) in row.iter().enumerate() {
+                if *v != 0.0 && col != cg && col != cz && col != 0 && col != 1 && col != nu - 1 {
+                    return None;
+                }
+            }
+            let rhs = r[rr];
+            let al = [row[cg], row[cz]];
+            let ab = [row[border[0]], row[border[1]], row[border[2]]];
+            let kk = &mut ne.k[i];
+            kk[0] += al[0] * al[0];
+            kk[1] += al[0] * al[1];
+            kk[2] += al[1] * al[1];
+            for l in 0..2 {
+                for b in 0..3 {
+                    ne.c[i][l][b] += al[l] * ab[b];
+                }
+                ne.g[[cg, cz][l]] += al[l] * rhs;
+                ne.diag[[cg, cz][l]] += al[l] * al[l];
+            }
+            for a in 0..3 {
+                for b in 0..3 {
+                    ne.e[a][b] += ab[a] * ab[b];
+                }
+                ne.g[border[a]] += ab[a] * rhs;
+                ne.diag[border[a]] += ab[a] * ab[a];
+            }
+        }
+        Some(ne)
+    }
+
+    /// The step d of (A + mu (diag(A) + 1e-12)) d = g; None when a pivot vanishes. One round of
+    /// iterative refinement (the leftover g - (A + damping) d, worked out with the structure,
+    /// solved for again) brings it to the dense LU solve's precision: without it the steps
+    /// of nearly singular systems (tiny mu) came out less precise and moved a few runs' peaks.
+    fn solve(&self, mu: f64) -> Option<Vec<f64>> {
+        let fac = self.factor(mu)?;
+        let mut d = self.apply(&fac, &self.g)?;
+        let ad = self.product(mu, &d);
+        let left: Vec<f64> = self.g.iter().zip(&ad).map(|(g, a)| g - a).collect();
+        if let Some(dd) = self.apply(&fac, &left) {
+            for (x, y) in d.iter_mut().zip(&dd) {
+                *x += y;
+            }
+        }
+        if d.iter().all(|v| v.is_finite()) { Some(d) } else { None }
+    }
+
+    fn damp(&self, mu: f64, col: usize) -> f64 {
+        mu * (self.diag[col] + 1e-12)
+    }
+
+    /// Eliminates every layer block from the bordered system [S + damping, U; U^T, -I]: what is
+    /// kept is each block's inverse and coupling, and the 6 x 6 system left on (ec, phi, load,
+    /// s1, s2, s3).
+    fn factor(&self, mu: f64) -> Option<NeFactor> {
+        let (nl, nu) = (self.nl, self.nu);
+        let border = [0, 1, nu - 1];
+        let mut z = [[0.0f64; 6]; 6];
+        for a in 0..3 {
+            for b in 0..3 {
+                z[a][b] = self.e[a][b];
+            }
+            z[a][a] += self.damp(mu, border[a]);
+            for k in 0..3 {
+                z[a][3 + k] = self.u[k][border[a]];
+                z[3 + k][a] = self.u[k][border[a]];
+            }
+            z[3 + a][3 + a] = -1.0;
+        }
+        // each layer block: K x + F y = g_l, with F its coupling to the six border unknowns
+        let mut inv = vec![[[0.0f64; 2]; 2]; nl];
+        let mut f = vec![[[0.0f64; 6]; 2]; nl];
+        for i in 0..nl {
+            let (cg, cz) = (2 + i, 2 + nl + i);
+            let kk = &self.k[i];
+            let (k00, k01, k11) = (kk[0] + self.damp(mu, cg), kk[1], kk[2] + self.damp(mu, cz));
+            let det = k00 * k11 - k01 * k01;
+            if !det.is_finite() || det.abs() < 1e-300 {
+                return None;
+            }
+            inv[i] = [[k11 / det, -k01 / det], [-k01 / det, k00 / det]];
+            for (l, col) in [cg, cz].into_iter().enumerate() {
+                f[i][l][..3].copy_from_slice(&self.c[i][l]);
+                for k in 0..3 {
+                    f[i][l][3 + k] = self.u[k][col];
+                }
+            }
+            // Schur complement: Z -= F^T K^-1 F
+            let mut kf = [[0.0f64; 6]; 2];
+            for l in 0..2 {
+                for b in 0..6 {
+                    kf[l][b] = inv[i][l][0] * f[i][0][b] + inv[i][l][1] * f[i][1][b];
+                }
+            }
+            for a in 0..6 {
+                let (fa0, fa1) = (f[i][0][a], f[i][1][a]);
+                if fa0 == 0.0 && fa1 == 0.0 {
+                    continue;
+                }
+                for b in 0..6 {
+                    z[a][b] -= fa0 * kf[0][b] + fa1 * kf[1][b];
+                }
+            }
+        }
+        Some(NeFactor { inv, f, z })
+    }
+
+    /// Solves the factored system for the right-hand side rhs (length nu).
+    fn apply(&self, fac: &NeFactor, rhs: &[f64]) -> Option<Vec<f64>> {
+        let (nl, nu) = (self.nl, self.nu);
+        let border = [0, 1, nu - 1];
+        let mut rz = [0.0f64; 6];
+        for a in 0..3 {
+            rz[a] = rhs[border[a]];
+        }
+        let mut kg = vec![[0.0f64; 2]; nl];
+        for i in 0..nl {
+            let gl = [rhs[2 + i], rhs[2 + nl + i]];
+            let inv = &fac.inv[i];
+            kg[i] = [inv[0][0] * gl[0] + inv[0][1] * gl[1], inv[1][0] * gl[0] + inv[1][1] * gl[1]];
+            for a in 0..6 {
+                rz[a] -= fac.f[i][0][a] * kg[i][0] + fac.f[i][1][a] * kg[i][1];
+            }
+        }
+        let mut zf: Vec<f64> = fac.z.iter().flat_map(|row| row.iter().copied()).collect();
+        let mut yb = rz.to_vec();
+        if !lu_solve(&mut zf, 6, &mut yb) {
+            return None;
+        }
+        let mut d = vec![0.0; nu];
+        for a in 0..3 {
+            d[border[a]] = yb[a];
+        }
+        for i in 0..nl {
+            // x = K^-1 (g_l - F y)
+            let fy = [(0..6).map(|b| fac.f[i][0][b] * yb[b]).sum::<f64>(), (0..6).map(|b| fac.f[i][1][b] * yb[b]).sum::<f64>()];
+            let inv = &fac.inv[i];
+            d[2 + i] = kg[i][0] - (inv[0][0] * fy[0] + inv[0][1] * fy[1]);
+            d[2 + nl + i] = kg[i][1] - (inv[1][0] * fy[0] + inv[1][1] * fy[1]);
+        }
+        Some(d)
+    }
+
+    /// (A + mu (diag(A) + 1e-12)) d, from the structure.
+    fn product(&self, mu: f64, d: &[f64]) -> Vec<f64> {
+        let (nl, nu) = (self.nl, self.nu);
+        let border = [0, 1, nu - 1];
+        let db = [d[border[0]], d[border[1]], d[border[2]]];
+        let mut out: Vec<f64> = (0..nu).map(|col| self.damp(mu, col) * d[col]).collect();
+        // the full rows: U (U^T d)
+        for row in &self.u {
+            let s: f64 = row.iter().zip(d).map(|(a, b)| a * b).sum();
+            for (o, a) in out.iter_mut().zip(row) {
+                *o += a * s;
+            }
+        }
+        // the layer rows: border block, layer blocks and their couplings
+        for a in 0..3 {
+            out[border[a]] += (0..3).map(|b| self.e[a][b] * db[b]).sum::<f64>();
+        }
+        for i in 0..nl {
+            let (cg, cz) = (2 + i, 2 + nl + i);
+            let x = [d[cg], d[cz]];
+            let kk = &self.k[i];
+            out[cg] += kk[0] * x[0] + kk[1] * x[1] + (0..3).map(|b| self.c[i][0][b] * db[b]).sum::<f64>();
+            out[cz] += kk[1] * x[0] + kk[2] * x[1] + (0..3).map(|b| self.c[i][1][b] * db[b]).sum::<f64>();
+            for a in 0..3 {
+                out[border[a]] += self.c[i][0][a] * x[0] + self.c[i][1][a] * x[1];
+            }
+        }
+        out
+    }
+}
+
+/// `NormalEq::factor`'s result: each layer block's inverse and border coupling, and the 6 x 6
+/// system left on the border.
+struct NeFactor {
+    inv: Vec<[[f64; 2]; 2]>,
+    f: Vec<[[f64; 6]; 2]>,
+    z: [[f64; 6]; 6],
+}
+
 /// The section system. Unknowns x = (ec, phi, gamma_1..n, ez_1..n, V): the transverse strain of
 /// every layer is an unknown of the whole system (with "no net transverse stress" as its
 /// equation), so a layer whose response folds back at cracking is followed by the path solver
@@ -688,6 +933,7 @@ fn correct_lm(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], q: &[f6
     let mut f = merit(&r, cons(&y));
     let mut mu = 1e-3;
     let mut polished = 0;
+    let dense_only = std::env::var("SR_DENSE_LU").is_ok();
     for it in 0..40 {
         let c = cons(&y);
         if within(sys, &r, &ev, 4.0) && (c / wn).abs() < 1e-6 {
@@ -695,39 +941,50 @@ fn correct_lm(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], q: &[f6
         }
         let j = sys.jac(&y, q, &r);
         let nr = r.len();
-        // normal equations of [J; wc w] d = [r; wc c], summed row by row over each row's
-        // non-zero entries only (a layer's rows touch 5 unknowns; only the axial-force and
-        // moment rows are full), which gives the same matrix far faster than the dense product
-        let mut nmat = vec![0.0; nu * nu];
-        let mut g = vec![0.0; nu];
-        let mut nz: Vec<(usize, f64)> = Vec::with_capacity(nu);
-        let mut add_row = |row: &[f64], rhs: f64, nz: &mut Vec<(usize, f64)>| {
-            nz.clear();
-            nz.extend(row.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(k, v)| (k, *v)));
-            for &(a, va) in nz.iter() {
-                g[a] += va * rhs;
-                let base = a * nu;
-                for &(b, vb) in nz.iter() {
-                    nmat[base + b] += va * vb;
-                }
-            }
-        };
-        for rr in 0..nr {
-            add_row(&j[rr * nu..(rr + 1) * nu], r[rr], &mut nz);
-        }
         let wrow: Vec<f64> = w.iter().map(|x| wc * x).collect();
-        add_row(&wrow, wc * c, &mut nz);
+        // normal equations of [J; wc w] d = [r; wc c]: kept in the section system's own
+        // structure where the slope matrix has it (see `NormalEq`), else as a dense matrix
+        let structured = if dense_only { None } else { NormalEq::build(&j, &r, &wrow, wc * c, sys.nl()) };
+        let mut nmat = vec![];
+        let mut g = vec![];
+        if structured.is_none() {
+            // dense: summed row by row over each row's non-zero entries only
+            nmat = vec![0.0; nu * nu];
+            g = vec![0.0; nu];
+            let mut nz: Vec<(usize, f64)> = Vec::with_capacity(nu);
+            let mut add_row = |row: &[f64], rhs: f64, nz: &mut Vec<(usize, f64)>| {
+                nz.clear();
+                nz.extend(row.iter().enumerate().filter(|(_, v)| **v != 0.0).map(|(k, v)| (k, *v)));
+                for &(a, va) in nz.iter() {
+                    g[a] += va * rhs;
+                    let base = a * nu;
+                    for &(b, vb) in nz.iter() {
+                        nmat[base + b] += va * vb;
+                    }
+                }
+            };
+            for rr in 0..nr {
+                add_row(&j[rr * nu..(rr + 1) * nu], r[rr], &mut nz);
+            }
+            add_row(&wrow, wc * c, &mut nz);
+        }
         let mut improved = false;
         for _ in 0..12 {
-            let mut a = nmat.clone();
-            for k in 0..nu {
-                a[k * nu + k] += mu * (nmat[k * nu + k] + 1e-12);
-            }
-            let mut d = g.clone();
-            if !lu_solve(&mut a, nu, &mut d) {
+            let step = match &structured {
+                Some(ne) => ne.solve(mu),
+                None => {
+                    let mut a = nmat.clone();
+                    for k in 0..nu {
+                        a[k * nu + k] += mu * (nmat[k * nu + k] + 1e-12);
+                    }
+                    let mut d = g.clone();
+                    if lu_solve(&mut a, nu, &mut d) { Some(d) } else { None }
+                }
+            };
+            let Some(d) = step else {
                 mu *= 10.0;
                 continue;
-            }
+            };
             let yn: Vec<f64> = y.iter().zip(&d).map(|(a, b)| a - b).collect();
             let (rn, en) = sys.resid(&yn, q);
             let fnew = merit(&rn, cons(&yn));
