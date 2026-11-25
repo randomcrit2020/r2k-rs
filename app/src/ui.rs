@@ -1409,27 +1409,35 @@ impl App {
         let orig_c = Color32::from_rgb(110, 110, 110);
         let (lim_c, lim_s) = (Color32::from_rgb(230, 120, 0), Color32::from_rgb(0, 140, 140));
         let mut series = vec![];
+        // the name of each series, for reading values off the plot
+        let mut names: Vec<&str> = vec![];
         let _ = orig_c; // the original's points are compared in the table, not drawn
         if show.cracking {
             series.push(Series { width: 1.2, ..Series::line(to(&r.cracking), RED) });
+            names.push("Cracking");
         }
         if show.long_yield {
             series.push(Series { width: 1.2, ..Series::line(to(&r.long_yield), green) });
+            names.push("Longitudinal yield");
         }
         if show.trans_yield {
             series.push(Series { width: 1.2, ..Series::line(to(&r.trans_yield), magenta) });
+            names.push("Transverse yield");
         }
         series.push(Series { width: 2.0, ..Series::line(to(&r.envelope()), BLUE) });
+        names.push("Strength envelope");
         let design_red = Color32::BLACK;
         let dm = if show.design { dm } else { None };
         if let Some(dm) = &dm {
             // ACI 318: (phi(et) M, phi_v V) for each envelope point
             series.push(Series { width: 2.0, ..Series::line(to(&dm.mv(&r.envelope(), n_axial)), design_red) });
+            names.push(if dm.a.code == 1 { "AASHTO LRFD design" } else { "ACI 318 design" });
         }
         if show.shear_peak {
             if let Some((_, s)) = &self.shear {
                 if let Some(p) = s.points.iter().max_by(|a, b| a.v.partial_cmp(&b.v).unwrap()) {
                     series.push(Series { dots: true, ..Series::line(vec![[p.m, p.v]], Color32::BLACK) });
+                    names.push("Shear analysis peak");
                 }
             }
         }
@@ -1581,6 +1589,14 @@ impl App {
                 Color32::DARK_GRAY,
             );
         }
+        // values read off the lines under the pointer (exact at computed points, interpolated between)
+        let lim_pts: Vec<(bool, &str, Vec<[f64; 2]>, Color32)> = vec![
+            (show.conc_limit, "Concrete at ecu", to(&r.conc_limit), lim_c),
+            (show.steel_limit, "Steel at its limit", to(&r.steel_limit), lim_s),
+        ];
+        let mut probes: Vec<plots::Probe> = series.iter().zip(&names).map(|(s, n)| plots::Probe { name: n, pts: &s.pts, color: s.color }).collect();
+        probes.extend(lim_pts.iter().filter(|l| l.0).map(|l| plots::Probe { name: l.1, pts: &l.2, color: l.3 }));
+        plots::readout(ui, &painter, &fr, "mv", &probes, ("M", "kNm"), ("V", "kN"), None);
         ui.allocate_rect(rect, egui::Sense::hover());
     }
 
@@ -1655,12 +1671,7 @@ impl App {
         let gap = 8.0;
         let rest = rect.width() - sk_w - 2.0 * gap;
         let r_sk = Rect::from_min_size(rect.min, Vec2::new(sk_w, rect.height()));
-        // the Mx-My plot is square (equal scales, so its shape reads true); the moment-curvature
-        // plot takes the rest
-        let side = (rest * 0.55).min(rect.height());
-        let r_c = Rect::from_min_size(Pos2::new(rect.min.x + sk_w + gap, rect.min.y), Vec2::new(side, side));
-        let r_m = Rect::from_min_max(Pos2::new(r_c.max.x + gap, rect.min.y), Pos2::new(rect.max.x, rect.min.y + side.max(rect.height() * 0.6)));
-        // Mx-My capacity diagram (square scales, so the shape reads true)
+        // Mx-My capacity diagram (equal scales, so the shape reads true)
         let cont = d.contour();
         let mut series = vec![Series { width: 2.0, ..Series::line(cont.iter().map(|p| [p.0, p.1]).collect(), BLUE) }];
         if let Some(a) = &aci {
@@ -1676,17 +1687,28 @@ impl App {
                 .collect();
             series.push(Series { width: 2.0, ..Series::line(des, Color32::BLACK) });
         }
-        let ext = cont.iter().map(|p| p.0.abs().max(p.1.abs())).fold(1.0, f64::max) * 1.1;
         if let Some(p) = run.peak_point() {
             series.push(Series { width: 1.2, ..Series::line(vec![[0.0, 0.0], [p.mx, p.my]], RED) });
             series.push(Series { dots: true, width: 0.0, ..Series::line(vec![[p.mx, p.my]], RED) });
         }
-        // invisible corners to make the axes equal and centred
-        series.push(Series { width: 0.0, ..Series::line(vec![[-ext, -ext], [ext, ext]], Color32::TRANSPARENT) });
-        let fr = plots::draw(&painter, r_c.shrink(6.0), &format!("Mx-My capacity at N = {:.0} kN", d.n), "Mx (kNm)", "My (kNm)", &series, None, None);
+        // layout, scaled to the window: a wide diagram goes on top of the moment-curvature plot,
+        // a tall (or round) one beside it; either way it gets as much room as its shape can use
+        let ratio = plots::data_aspect(&series) as f32;
+        let right = Rect::from_min_max(Pos2::new(rect.min.x + sk_w + gap, rect.min.y), rect.max);
+        let (r_c, r_m) = if ratio > 1.3 {
+            let h = (rest / ratio + 60.0).clamp(rect.height() * 0.4, rect.height() * 0.65);
+            let r_c = Rect::from_min_size(right.min, Vec2::new(rest + gap, h));
+            (r_c, Rect::from_min_max(Pos2::new(right.min.x, r_c.max.y + gap), right.max))
+        } else {
+            let w = (rect.height() * ratio + 60.0).clamp(rest * 0.4, rest * 0.65);
+            let r_c = Rect::from_min_size(right.min, Vec2::new(w, rect.height()));
+            (r_c, Rect::from_min_max(Pos2::new(r_c.max.x + gap, right.min.y), right.max))
+        };
+        let (xr, yr) = plots::equal_ranges(r_c.shrink(6.0), &series, 44.0);
+        let fr = plots::draw(&painter, r_c.shrink(6.0), &format!("Mx-My capacity at N = {:.0} kN", d.n), "Mx (kNm)", "My (kNm)", &series, Some(yr), Some(xr));
         let clip = painter.with_clip_rect(fr.plot);
-        clip.line_segment([fr.map(-ext, 0.0), fr.map(ext, 0.0)], Stroke::new(0.8, Color32::GRAY));
-        clip.line_segment([fr.map(0.0, -ext), fr.map(0.0, ext)], Stroke::new(0.8, Color32::GRAY));
+        clip.line_segment([fr.map(fr.x0, 0.0), fr.map(fr.x1, 0.0)], Stroke::new(0.8, Color32::GRAY));
+        clip.line_segment([fr.map(0.0, fr.y0), fr.map(0.0, fr.y1)], Stroke::new(0.8, Color32::GRAY));
         let mut ly = fr.plot.top() + 10.0;
         let lx = fr.plot.left() + 10.0;
         let mut leg = vec![("nominal capacity", BLUE), ("chosen load angle", RED)];
@@ -1697,6 +1719,21 @@ impl App {
             painter.line_segment([Pos2::new(lx, ly), Pos2::new(lx + 24.0, ly)], Stroke::new(2.0, c));
             painter.text(Pos2::new(lx + 30.0, ly), Align2::LEFT_CENTER, name, FontId::proportional(12.0), Color32::BLACK);
             ly += 18.0;
+        }
+        // values read off the curves under the pointer: series 0 is the nominal contour, then the
+        // design contour (if any), then the chosen angle's line and peak
+        {
+            let mut probes = vec![plots::Probe { name: "Nominal capacity", pts: &series[0].pts, color: BLUE }];
+            let mut k = 1;
+            if aci.is_some() {
+                probes.push(plots::Probe { name: if aci.as_ref().map(|a| a.code == 1).unwrap_or(false) { "AASHTO LRFD design" } else { "ACI 318 design" }, pts: &series[1].pts, color: Color32::BLACK });
+                k = 2;
+            }
+            if run.peak_point().is_some() {
+                probes.push(plots::Probe { name: "Peak at the chosen angle", pts: &series[k + 1].pts, color: RED });
+            }
+            let polar = |mx: f64, my: f64| format!("M = {:.1} kNm at α = {:.1}°", mx.hypot(my), my.atan2(mx).to_degrees());
+            plots::readout(ui, &painter, &fr, "mxmy", &probes, ("Mx", "kNm"), ("My", "kNm"), Some(&polar));
         }
         // moment-curvature at the chosen angle
         let mk: Vec<[f64; 2]> = run.points.iter().map(|p| [p.kappa, p.m]).collect();
@@ -1860,8 +1897,6 @@ impl App {
         }
         let rect = ui.available_rect_before_wrap();
         let painter = ui.painter_at(rect);
-        let side = (rect.width() * 0.62).min(rect.height());
-        let r_c = Rect::from_min_size(rect.min, Vec2::new(side, side));
         let cont = d.contour();
         let mut series = vec![Series { width: 2.0, ..Series::line(cont.iter().map(|p| [p.0, p.1]).collect(), BLUE) }];
         // reference ellipse through the four principal capacities: (Vx/Vnx)^2 + (Vy/Vny)^2 = 1
@@ -1901,13 +1936,17 @@ impl App {
         }
         series.push(Series { width: 1.2, ..Series::line(vec![[0.0, 0.0], [vux, vuy]], RED) });
         series.push(Series { dots: true, width: 0.0, ..Series::line(vec![[vux, vuy]], RED) });
-        let ext = cont.iter().map(|p| p.0.abs().max(p.1.abs())).fold(vux.abs().max(vuy.abs()), f64::max).max(1.0) * 1.1;
-        series.push(Series { width: 0.0, ..Series::line(vec![[-ext, -ext], [ext, ext]], Color32::TRANSPARENT) });
+        // the plot takes the full height and as much width as its shape can use (equal scales, so
+        // the shape reads true), leaving room on the right for the legend and the table
+        let table_w = 450.0_f32.min(rect.width() * 0.45);
+        let w = (rect.height() * plots::data_aspect(&series) as f32 + 60.0).clamp(rect.width() * 0.35, (rect.width() - table_w).max(rect.width() * 0.35));
+        let r_c = Rect::from_min_size(rect.min, Vec2::new(w, rect.height()));
         let title = format!("Vx-Vy shear capacity at N = {:.0} kN, M/V = {:.2} m", d.n, d.mv);
-        let fr = plots::draw(&painter, r_c.shrink(6.0), &title, "Vx (kN, sideways)", "Vy (kN, vertical)", &series, None, None);
+        let (xr, yr) = plots::equal_ranges(r_c.shrink(6.0), &series, 0.0);
+        let fr = plots::draw(&painter, r_c.shrink(6.0), &title, "Vx (kN, sideways)", "Vy (kN, vertical)", &series, Some(yr), Some(xr));
         let clip = painter.with_clip_rect(fr.plot);
-        clip.line_segment([fr.map(-ext, 0.0), fr.map(ext, 0.0)], Stroke::new(0.8, Color32::GRAY));
-        clip.line_segment([fr.map(0.0, -ext), fr.map(0.0, ext)], Stroke::new(0.8, Color32::GRAY));
+        clip.line_segment([fr.map(fr.x0, 0.0), fr.map(fr.x1, 0.0)], Stroke::new(0.8, Color32::GRAY));
+        clip.line_segment([fr.map(0.0, fr.y0), fr.map(0.0, fr.y1)], Stroke::new(0.8, Color32::GRAY));
         // each direction's point, coloured by what governed it
         for r in &d.runs {
             let c = match r.mech {
@@ -1919,6 +1958,26 @@ impl App {
                 _ => Color32::from_rgb(130, 130, 130),
             };
             clip.circle_filled(fr.map(r.vx(), r.vy()), 4.0, c);
+        }
+        // values read off the curves under the pointer: series 0 nominal, 1 the ellipse, then the
+        // design contour and the ACI rule (if shown), then the demand line and its point
+        {
+            let mut probes = vec![
+                plots::Probe { name: "Nominal capacity", pts: &series[0].pts, color: BLUE },
+                plots::Probe { name: "Ellipse through the 0/90/180/270° capacities", pts: &series[1].pts, color: Color32::from_gray(150) },
+            ];
+            let mut k = 2;
+            if let Some(a) = &aci {
+                probes.push(plots::Probe { name: if a.code == 1 { "AASHTO LRFD design" } else { "ACI 318 design" }, pts: &series[k].pts, color: design_black });
+                k += 1;
+                if a.code == 0 {
+                    probes.push(plots::Probe { name: "ACI 318 two-direction rule", pts: &series[k].pts, color: Color32::from_rgb(120, 60, 160) });
+                    k += 1;
+                }
+            }
+            probes.push(plots::Probe { name: "Demand (Vux, Vuy)", pts: &series[k + 1].pts, color: RED });
+            let polar = |vx: f64, vy: f64| format!("V = {:.1} kN at θ = {:.1}° (from vertical)", vx.hypot(vy), vx.atan2(vy).to_degrees());
+            plots::readout(ui, &painter, &fr, "vxvy", &probes, ("Vx", "kN"), ("Vy", "kN"), Some(&polar));
         }
         // legend and the table of directions, to the right
         let lx = r_c.max.x + 16.0;
@@ -2185,6 +2244,23 @@ impl App {
                 clip.circle_stroke(at, 4.0, Stroke::new(1.6, c));
             }
         }
+        // values read off the curves under the pointer (exact at computed points, interpolated between)
+        let design_name = dm.as_ref().map(|m| format!("{} design", m.a.name())).unwrap_or_default();
+        let mut probes = vec![plots::Probe { name: "Nominal capacity", pts: &series[0].pts, color: BLUE }];
+        if dm.is_some() {
+            probes.push(plots::Probe { name: &design_name, pts: &series[1].pts, color: design_red });
+        }
+        let (ax, ay) = match d.pair {
+            Pair::MN => (("M", "kNm"), ("N", "kN")),
+            Pair::NV => (("N", "kN"), ("V", "kN")),
+            Pair::MV => (("M", "kNm"), ("V", "kN")),
+        };
+        let id = match d.pair {
+            Pair::MN => "radial_mn",
+            Pair::NV => "radial_nv",
+            Pair::MV => "radial_mv",
+        };
+        plots::readout(ui, &painter, &fr, id, &probes, ax, ay, None);
         ui.allocate_rect(rect, egui::Sense::hover());
     }
 
