@@ -267,76 +267,47 @@ pub fn section_page(ui: &mut egui::Ui, sec: &Section, n_elements: usize) {
     ui.allocate_rect(r, egui::Sense::hover());
 }
 
-/// Draw the stirrup and the bars the way the original does (r2k 0x4a32f0 and its helpers):
-/// * every bend is two concentric arcs (the bar's two faces) of bend diameter
-///   D = max(4 db, (57.2957 db[m] + 2.5) db) (0x4a6290), outer radius (D + db)/2;
-/// * hooks (0x4a6c90) are a bend followed by a straight tail max(6 db, 60 mm) long (0x52f080,
-///   0x52e598), drawn as a three-sided strip one bar wide;
-/// * closed stirrup: rounded rectangle, both ends hooked at the top-left corner, tails at -45
-///   degrees (0x4a69a0); open stirrup: a U whose two top ends hook inwards and cross; single leg:
-///   one leg just left of the middle bar with a hook at each end; T-headed: one leg with plates
-///   6 db wide at both ends (0x4a7310); hoop: a circle on the stirrup's height (0x4a2540);
-///   interlocking hoops: two such circles, one at the top and one at the bottom;
-/// * the stirrup's outer faces sit at the clear cover from the sides;
-/// * bars (0x4a2b00): circles of the bar's diameter, white (grey for strands); inside a
-///   rectangular stirrup a row spreads edge to edge between the stirrup's inner faces, otherwise
-///   the bars split the width in equal parts (spacing b / (n + 1)).
+/// Draw the stirrup and the bars as a reinforcement detail: the original's layout (r2k 0x4a32f0
+/// and its helpers), drawn the way a detailing drawing shows bent bars.
+/// * A bent bar is its centre line (straight runs and bends) drawn as its two faces, half a bar
+///   either side, so every bend's faces are concentric arcs running on tangentially into the
+///   straight parts, and both ends are squared off.
+/// * Bends have the bend diameter D = max(4 db, (57.2957 db[m] + 2.5) db) inside (0x4a6290), or
+///   the corner bar's diameter where that is larger, so the corner bar fits the bend.
+/// * Hooks (0x4a6c90) bend 135 degrees around the corner bar and run on in a straight tail
+///   max(6 db, 60 mm) long (0x52f080, 0x52e598) into the core.
+/// * Closed stirrup: rounded rectangle with both ends hooked around the top-left corner bar,
+///   tails at -45 degrees (0x4a69a0); open stirrup: a U whose top ends hook inwards around the
+///   corner bars; single leg: one leg just left of the middle bar with a hook at each end;
+///   T-headed: one leg with plates 6 db wide at both ends (0x4a7310); hoop: a circle on the
+///   stirrup's height (0x4a2540); interlocking hoops: two such circles, one at the top and one at
+///   the bottom.
+/// * The stirrup's outer faces sit at the clear cover from the sides.
+/// * Bars (0x4a2b00): circles of the bar's diameter, white (grey for strands), where
+///   `bar_draw_points` seats them: on the stirrup's legs and in its bends.
 /// Returns the point to hang the stirrup label on (screen) and the stirrup.
 pub fn draw_steel<'a>(p: &egui::Painter, sec: &'a Section, map: &dyn Fn(f64, f64) -> Pos2, sc: f64) -> Option<(Pos2, &'a Stirrups)> {
-    let h = sec.height();
     let thin = Stroke::new(1.0, Color32::BLACK);
     let line = |a: (f64, f64), b: (f64, f64)| p.line_segment([map(a.0, a.1), map(b.0, b.1)], thin);
-    // an arc from a1 to a2 (degrees, counter-clockwise positive, y right and z up)
-    let arc = |c: (f64, f64), r: f64, a1: f64, a2: f64| {
-        let n = (((a2 - a1).abs() / 6.0).ceil() as usize).max(2);
-        let pts: Vec<Pos2> = (0..=n)
+    let circle = |c: (f64, f64), r: f64| {
+        let n = 120;
+        let pts: Vec<Pos2> = (0..n)
             .map(|i| {
-                let a = (a1 + (a2 - a1) * i as f64 / n as f64).to_radians();
+                let a = std::f64::consts::TAU * i as f64 / n as f64;
                 map(c.0 + r * a.cos(), c.1 + r * a.sin())
             })
             .collect();
-        p.add(egui::Shape::line(pts, thin));
+        p.add(egui::Shape::closed_line(pts, thin));
     };
+    let d45 = std::f64::consts::FRAC_1_SQRT_2;
     let mut anchor = None;
     let st = sec.stirrups.as_ref();
-    let mut rect_inner: Option<(f64, f64)> = None; // inner faces' half width and the clear cover
-    let mut leg_x = 0.0;
     if let Some(st) = st {
         let db = st.db.max(1.0);
         let w = db;
-        let dbm = db / 1000.0;
-        let d_bend = (4.0 * db).max((57.2957 * dbm + 2.5) * db);
-        let rr = (d_bend + db) / 2.0;
         let tail = (6.0 * db).max(60.0);
         let zt = st.z_top.max(st.z_bot);
         let zb = st.z_top.min(st.z_bot);
-        let (ztf, zbf) = (zt + w / 2.0, zb - w / 2.0);
-        // two faces of a bend
-        let bend = |c: (f64, f64), a1: f64, a2: f64| {
-            arc(c, rr, a1, a2);
-            arc(c, rr - w, a1, a2);
-        };
-        // a bend and its tail
-        let hook = |c: (f64, f64), r: f64, a1: f64, a2: f64| {
-            arc(c, r, a1, a2);
-            arc(c, r - w, a1, a2);
-            let t = if a1 > a2 { a2 - 90.0 } else { a2 + 90.0 }.to_radians();
-            let a = a2.to_radians();
-            let s1 = (c.0 + r * a.cos(), c.1 + r * a.sin());
-            let s2 = (c.0 + (r - w) * a.cos(), c.1 + (r - w) * a.sin());
-            let e1 = (s1.0 + tail * t.cos(), s1.1 + tail * t.sin());
-            let e2 = (s2.0 + tail * t.cos(), s2.1 + tail * t.sin());
-            line(s1, e1);
-            line(s2, e2);
-            line(e1, e2);
-        };
-        // the height of the bar layer the leg passes (single legs): just left of a middle bar
-        let off = sec
-            .long
-            .iter()
-            .filter(|l| l.num % 2 == 1)
-            .map(|l| l.draw_dia() / 2.0 + db / 2.0)
-            .fold(0.0, f64::max);
         let mid_y = 0.5 * (zt + zb);
         match st.pattern {
             4 | 6 => {
@@ -345,22 +316,22 @@ pub fn draw_steel<'a>(p: &egui::Painter, sec: &'a Section, map: &dyn Fn(f64, f64
                 let r = if st.pattern == 4 { (zt - zb) / 2.0 } else { ((zt - zb) / 2.0).min(wmid / 2.0 - cover - db / 2.0) };
                 let centres = if st.pattern == 4 { vec![mid_y] } else { vec![zt - r, zb + r] };
                 for (k, zc) in centres.iter().enumerate() {
-                    arc((0.0, *zc), r + db / 2.0, 0.0, 360.0);
-                    arc((0.0, *zc), r - db / 2.0, 0.0, 360.0);
-                    let at = map(r + db / 2.0, *zc);
+                    circle((0.0, *zc), r + db / 2.0);
+                    circle((0.0, *zc), r - db / 2.0);
                     if k == 0 {
-                        anchor = Some(at);
+                        anchor = Some(map(r + db / 2.0, *zc));
                     }
                 }
             }
             1 | 5 => {
-                leg_x = -off;
-                let xl = leg_x - w / 2.0;
+                // the leg just left of the middle bar of the rows with one
+                let off = sec.long.iter().filter(|l| l.num % 2 == 1).map(|l| l.draw_dia() / 2.0 + db / 2.0).fold(0.0, f64::max);
+                let xl = -off;
                 if st.pattern == 5 {
-                    line((xl, zt), (xl, zb));
-                    line((xl + w, zt), (xl + w, zb));
+                    line((xl - w / 2.0, zt), (xl - w / 2.0, zb));
+                    line((xl + w / 2.0, zt), (xl + w / 2.0, zb));
                     for zc in [zt, zb] {
-                        let (x0, x1) = (leg_x - 3.0 * w, leg_x + 3.0 * w);
+                        let (x0, x1) = (xl - 3.0 * w, xl + 3.0 * w);
                         let (z0, z1) = (zc - w / 2.0, zc + w / 2.0);
                         line((x0, z0), (x1, z0));
                         line((x1, z0), (x1, z1));
@@ -368,78 +339,247 @@ pub fn draw_steel<'a>(p: &egui::Painter, sec: &'a Section, map: &dyn Fn(f64, f64
                         line((x0, z1), (x0, z0));
                     }
                 } else {
-                    let ct = (xl + rr, ztf - rr);
-                    let cb = (xl + rr, zbf + rr);
-                    hook(ct, rr, 180.0, 45.0);
-                    hook(cb, rr, -180.0, -45.0);
-                    line((xl, ct.1), (xl, cb.1));
-                    line((xl + w, ct.1), (xl + w, cb.1));
+                    let rc = bend_inner_radius(db) + w / 2.0;
+                    let ct = (xl + rc, zt - rc);
+                    let cb = (xl + rc, zb + rc);
+                    let t0 = (ct.0 + rc * d45, ct.1 + rc * d45);
+                    let b0 = (cb.0 + rc * d45, cb.1 - rc * d45);
+                    let path = [
+                        Seg::Line((t0.0 + tail * d45, t0.1 - tail * d45), t0),
+                        Seg::Arc(ct, rc, 45.0, 180.0),
+                        Seg::Line((xl, ct.1), (xl, cb.1)),
+                        Seg::Arc(cb, rc, 180.0, 315.0),
+                        Seg::Line(b0, (b0.0 + tail * d45, b0.1 + tail * d45)),
+                    ];
+                    bent_bar(p, map, &path, w, thin);
                 }
-                anchor = Some(map(leg_x + w / 2.0, mid_y));
+                anchor = Some(map(xl + w / 2.0, mid_y));
             }
             _ => {
-                // rectangular stirrup (open or closed)
-                let wmin = [zb + 1.0, mid_y, zt - 1.0].iter().map(|z| sec.width_at(*z)).fold(f64::INFINITY, f64::min);
-                let mut c = (zb - db / 2.0).max(0.0);
-                if wmin < 2.0 * c + 2.0 * db {
-                    c = (wmin - 2.0 * db) / 3.0;
+                // rectangular stirrup (open or closed), traced from the tail of the hook at the
+                // top-left corner, down the left leg, along the bottom and up the right leg
+                if let Some(t) = rect_tie(sec) {
+                    let x = t.xi + w / 2.0; // centre line, half width
+                    let (rb, rt) = (t.ri_b + w / 2.0, t.ri_t + w / 2.0); // centre-line bend radii
+                    let (bl, br) = ((-x + rb, zb + rb), (x - rb, zb + rb));
+                    let (tl, tr) = ((-x + rt, zt - rt), (x - rt, zt - rt));
+                    let h0 = (tl.0 + rt * d45, tl.1 + rt * d45);
+                    let mut path = vec![
+                        Seg::Line((h0.0 + tail * d45, h0.1 - tail * d45), h0),
+                        Seg::Arc(tl, rt, 45.0, 180.0),
+                        Seg::Line((-x, tl.1), (-x, bl.1)),
+                        Seg::Arc(bl, rb, 180.0, 270.0),
+                        Seg::Line((bl.0, zb), (br.0, zb)),
+                        Seg::Arc(br, rb, 270.0, 360.0),
+                        Seg::Line((x, br.1), (x, tr.1)),
+                    ];
+                    if st.pattern == 2 {
+                        // open: the right leg hooks inwards around its corner bar too
+                        let e = (tr.0 - rt * d45, tr.1 + rt * d45);
+                        path.push(Seg::Arc(tr, rt, 0.0, 135.0));
+                        path.push(Seg::Line(e, (e.0 - tail * d45, e.1 - tail * d45)));
+                    } else {
+                        // closed: across the top and round the top-left corner bar a second time
+                        let e = (tl.0 - rt * d45, tl.1 - rt * d45);
+                        path.push(Seg::Arc(tr, rt, 0.0, 90.0));
+                        path.push(Seg::Line((tr.0, zt), (tl.0, zt)));
+                        path.push(Seg::Arc(tl, rt, 90.0, 225.0));
+                        path.push(Seg::Line(e, (e.0 + tail * d45, e.1 - tail * d45)));
+                    }
+                    bent_bar(p, map, &path, w, thin);
+                    anchor = Some(map(t.xi + w, mid_y));
                 }
-                let xr = wmin / 2.0 - c;
-                let xl = -xr;
-                rect_inner = Some((xr - w, c));
-                let (bl, br) = ((xl + rr, zbf + rr), (xr - rr, zbf + rr));
-                let (tl, tr) = ((xl + rr, ztf - rr), (xr - rr, ztf - rr));
-                bend(bl, -180.0, -90.0);
-                bend(br, 0.0, -90.0);
-                // bottom, both sides
-                line((bl.0, zbf), (br.0, zbf));
-                line((bl.0, zbf + w), (br.0, zbf + w));
-                if st.pattern == 2 {
-                    line((xl, bl.1), (xl, tl.1));
-                    line((xl + w, bl.1), (xl + w, tl.1));
-                }
-                line((xr, br.1), (xr, tr.1));
-                line((xr - w, br.1), (xr - w, tr.1));
-                if st.pattern == 2 {
-                    hook(tl, rr, 180.0, 45.0);
-                    hook(tr, rr, 0.0, 135.0);
-                } else {
-                    bend(tr, 0.0, 90.0);
-                    // both ends hooked at the top-left corner; a top bar there opens the bend
-                    let top_bar = sec
-                        .long
-                        .iter()
-                        .filter(|l| (zt - l.z).abs() < 2.0 * db + l.draw_dia())
-                        .map(|l| l.draw_dia())
-                        .fold(0.0, f64::max);
-                    let r2 = ((d_bend.max(top_bar + db)) + db) / 2.0;
-                    let ctl = (xl + r2, ztf - r2);
-                    hook(ctl, r2, 180.0, 45.0);
-                    hook(ctl, r2, 90.0, 225.0);
-                    line((xl, bl.1), (xl, ctl.1));
-                    line((xl + w, bl.1), (xl + w, ctl.1));
-                    line((ctl.0, ztf), (tr.0, ztf));
-                    line((ctl.0, ztf - w), (tr.0, ztf - w));
-                }
-                anchor = Some(map(xr, mid_y));
             }
         }
     }
     // bars
-    let _ = rect_inner;
     for l in &sec.long {
         let db = l.draw_dia().max(1.0);
-        let xs = bar_xs(sec, l);
         let r = ((db / 2.0) * sc).max(2.5) as f32;
         let ps = sec.prestress.iter().any(|ps| ps.name == l.steel);
-        for x in xs {
-            let c = map(x, l.z);
+        for (x, z) in bar_draw_points(sec, l) {
+            let c = map(x, z);
             p.circle_filled(c, r, if ps { Color32::from_gray(190) } else { Color32::WHITE });
             p.circle_stroke(c, r, thin);
         }
     }
-    let _ = leg_x;
     st.and_then(|s| anchor.map(|a| (a, s)))
+}
+
+/// Inside radius of a stirrup bend: half the bend diameter max(4 db, (57.2957 db[m] + 2.5) db)
+/// (r2k 0x4a6290).
+fn bend_inner_radius(db: f64) -> f64 {
+    (4.0 * db).max((57.2957 * db / 1000.0 + 2.5) * db) / 2.0
+}
+
+/// A piece of a bent bar's centre line: a straight run, or a bend (centre, radius, start and end
+/// angle in degrees, counter-clockwise positive; an end angle below the start runs clockwise).
+#[derive(Clone, Copy)]
+enum Seg {
+    Line((f64, f64), (f64, f64)),
+    Arc((f64, f64), f64, f64, f64),
+}
+
+/// A bent bar of diameter w along its centre line: both faces as continuous lines, half a bar
+/// either side of the centre line (so each bend's faces are concentric arcs running on into the
+/// straight parts), and both ends squared off. The path must run on tangentially.
+fn bent_bar(p: &egui::Painter, map: &dyn Fn(f64, f64) -> Pos2, path: &[Seg], w: f64, stroke: Stroke) {
+    // side +1: the face on the left of the direction of travel
+    let face = |side: f64| -> Vec<Pos2> {
+        let mut pts: Vec<Pos2> = vec![];
+        let mut push = |q: Pos2| {
+            if pts.last().map(|l: &Pos2| l.distance(q) > 0.05).unwrap_or(true) {
+                pts.push(q);
+            }
+        };
+        for s in path {
+            match *s {
+                Seg::Line(a, b) => {
+                    let (dx, dz) = (b.0 - a.0, b.1 - a.1);
+                    let len = (dx * dx + dz * dz).sqrt().max(1e-9);
+                    let (nx, nz) = (-dz / len * side * w / 2.0, dx / len * side * w / 2.0);
+                    push(map(a.0 + nx, a.1 + nz));
+                    push(map(b.0 + nx, b.1 + nz));
+                }
+                Seg::Arc(c, r, a1, a2) => {
+                    // counter-clockwise the left face is the inside of the bend
+                    let rr = if a2 > a1 { r - side * w / 2.0 } else { r + side * w / 2.0 };
+                    let n = ((a2 - a1).abs() / 3.0).ceil().max(2.0) as usize;
+                    for i in 0..=n {
+                        let a = (a1 + (a2 - a1) * i as f64 / n as f64).to_radians();
+                        push(map(c.0 + rr * a.cos(), c.1 + rr * a.sin()));
+                    }
+                }
+            }
+        }
+        pts
+    };
+    let (l, r) = (face(1.0), face(-1.0));
+    if let (Some(l0), Some(r0), Some(l1), Some(r1)) = (l.first(), r.first(), l.last(), r.last()) {
+        p.line_segment([*l0, *r0], stroke);
+        p.line_segment([*l1, *r1], stroke);
+    }
+    p.add(egui::Shape::line(l, stroke));
+    p.add(egui::Shape::line(r, stroke));
+}
+
+/// A rectangular stirrup (open or closed) as the detail draws it: half width of its inner faces,
+/// heights of the inner faces of its bottom and top legs, and the inside radii of its bottom and
+/// top bends (the bend diameter's, or the corner bar's where larger).
+struct RectTie {
+    xi: f64,
+    zin_b: f64,
+    zin_t: f64,
+    ri_b: f64,
+    ri_t: f64,
+}
+
+#[derive(PartialEq)]
+enum Leg {
+    Bottom,
+    Top,
+}
+
+impl RectTie {
+    /// The leg a row of bars rests on: one closer to it than its bar radius (or into it).
+    fn leg_of(&self, l: &LongLayer) -> Option<Leg> {
+        let rb = l.draw_dia().max(1.0) / 2.0;
+        let mid = 0.5 * (self.zin_b + self.zin_t);
+        if l.z < mid && (l.z - rb) - self.zin_b < rb {
+            Some(Leg::Bottom)
+        } else if l.z > mid && self.zin_t - (l.z + rb) < rb {
+            Some(Leg::Top)
+        } else {
+            None
+        }
+    }
+
+    /// The farthest a bar of radius rb can sit from the centre line at height z, inside the
+    /// stirrup's inner faces and bends.
+    fn x_limit(&self, z: f64, rb: f64) -> f64 {
+        let (rcb, rct) = ((self.ri_b - rb).max(0.0), (self.ri_t - rb).max(0.0));
+        let (zcb, zct) = (self.zin_b + self.ri_b, self.zin_t - self.ri_t);
+        if z < zcb {
+            let dz = (zcb - z).min(rcb);
+            self.xi - self.ri_b + (rcb * rcb - dz * dz).max(0.0).sqrt()
+        } else if z > zct {
+            let dz = (z - zct).min(rct);
+            self.xi - self.ri_t + (rct * rct - dz * dz).max(0.0).sqrt()
+        } else {
+            self.xi - rb
+        }
+    }
+}
+
+/// Whether `bar_xs` spreads a row between a rectangular stirrup's inner faces (inner half width
+/// xi), rather than across the section.
+fn in_tie(sec: &Section, l: &LongLayer, xi: f64) -> bool {
+    let h = sec.height();
+    let db = l.draw_dia().max(1.0);
+    let n = l.num.max(1) as f64;
+    let wl = sec.width_at((l.z - db / 2.0).max(0.0)).min(sec.width_at((l.z + db / 2.0).min(h))).max(1.0);
+    l.ring == 0 && l.num >= 2 && 2.0 * xi > n * db && 2.0 * xi / wl > 0.3
+}
+
+fn rect_tie(sec: &Section) -> Option<RectTie> {
+    let st = sec.stirrups.as_ref()?;
+    let xi = rect_inner_half(sec)?;
+    let db = st.db.max(1.0);
+    let (zt, zb) = (st.z_top.max(st.z_bot), st.z_top.min(st.z_bot));
+    let ri = bend_inner_radius(db);
+    let mut t = RectTie { xi, zin_b: zb + db / 2.0, zin_t: zt - db / 2.0, ri_b: ri, ri_t: ri };
+    let (mut big_b, mut big_t) = (0.0f64, 0.0f64);
+    for l in sec.long.iter().filter(|l| in_tie(sec, l, xi)) {
+        let rb = l.draw_dia().max(1.0) / 2.0;
+        match t.leg_of(l) {
+            Some(Leg::Bottom) => big_b = big_b.max(rb),
+            Some(Leg::Top) => big_t = big_t.max(rb),
+            None => {}
+        }
+    }
+    t.ri_b = t.ri_b.max(big_b);
+    t.ri_t = t.ri_t.max(big_t);
+    Some(t)
+}
+
+/// Where the drawing puts a row's bars (mm from the centre line, mm up): as `bar_xs` and the
+/// row's height, except that inside a rectangular stirrup a row on one of its legs rests on that
+/// leg with its end bars seated in the bends (touching the bend on its 45-degree line), and other
+/// rows' end bars stay clear of the bends. Drawing only: the analyses keep `bar_xs` and the row's
+/// own height.
+pub fn bar_draw_points(sec: &Section, l: &LongLayer) -> Vec<(f64, f64)> {
+    let xs = bar_xs(sec, l);
+    let plain = || xs.iter().map(|x| (*x, l.z)).collect::<Vec<_>>();
+    let Some(t) = rect_tie(sec) else { return plain() };
+    if !in_tie(sec, l, t.xi) || xs.len() < 2 {
+        return plain();
+    }
+    let d45 = std::f64::consts::FRAC_1_SQRT_2;
+    let rb = l.draw_dia().max(1.0) / 2.0;
+    // the right-hand end bar, and the height of the bars between
+    let (end, z_row) = match t.leg_of(l) {
+        Some(Leg::Bottom) => {
+            let rc = (t.ri_b - rb).max(0.0);
+            ((t.xi - t.ri_b + rc * d45, t.zin_b + t.ri_b - rc * d45), t.zin_b + rb)
+        }
+        Some(Leg::Top) => {
+            let rc = (t.ri_t - rb).max(0.0);
+            ((t.xi - t.ri_t + rc * d45, t.zin_t - t.ri_t + rc * d45), t.zin_t - rb)
+        }
+        None => ((t.x_limit(l.z, rb), l.z), l.z),
+    };
+    let n = xs.len();
+    (0..n)
+        .map(|i| {
+            if i == 0 {
+                end
+            } else if i == n - 1 {
+                (-end.0, end.1)
+            } else {
+                (end.0 - 2.0 * end.0 * i as f64 / (n - 1) as f64, z_row)
+            }
+        })
+        .collect()
 }
 
 /// The inner faces' half width of a rectangular stirrup (open or closed), as draw_steel places

@@ -147,35 +147,16 @@ pub fn section_state(p: &egui::Painter, cell: Rect, sec: &Section, st: &SectionS
     let mut ring: Vec<Pos2> = sec.outline.iter().map(|(z, w)| map(w / 2.0, *z)).collect();
     ring.extend(sec.outline.iter().rev().map(|(z, w)| map(-w / 2.0, *z)));
     p.add(egui::Shape::closed_line(ring, Stroke::new(1.2, Color32::from_gray(60))));
-    if let Some(sr) = &sec.stirrups {
-        let zt = sr.z_top.max(sr.z_bot);
-        let zb = sr.z_top.min(sr.z_bot);
-        let wmin = sec.width_at(zb + 1.0).min(sec.width_at(0.5 * (zb + zt)));
-        let half = (wmin / 2.0 - zb.min(h - zt).max(20.0)).max(5.0);
-        let rad = (sr.db * 1.5).max(8.0);
-        let stroke = Stroke::new(((sr.db * s) as f32 * 0.6).clamp(1.2, 4.0), Color32::from_gray(70));
-        let r = Rect::from_min_max(map(-half, zt), map(half, zb));
-        p.rect_stroke(r, (rad * s) as f32, stroke, egui::StrokeKind::Middle);
-        // 135-degree hooks at the top corners
-        let hook = (6.0 * sr.db).max(40.0) * s;
-        for sgn in [-1.0f64, 1.0] {
-            let c = map(sgn * (half - rad * 0.4), zt - rad * 0.4);
-            let end = Pos2::new(c.x - (sgn * hook * 0.7) as f32, c.y + (hook * 0.7) as f32);
-            p.line_segment([c, end], stroke);
-        }
-    }
+    // stirrup and bars detailed and placed exactly as on the cross-section page (both faces of
+    // the stirrup, bends of the real bend diameter, 135-degree hooks with their tails, bars
+    // inside the stirrup's corners), then every bar filled with its state colour
+    let _ = crate::section_page::draw_steel(p, sec, &map, s);
     for (k, l) in sec.long.iter().enumerate() {
-        let w = sec.width_at(l.z).min(sec.width_at((l.z - 1.0).max(0.0)).max(1.0));
-        let db = l.bar_dia();
-        let edge = (w * 0.15).clamp(db, 70.0);
-        let inner = (w / 2.0 - edge).max(0.0);
-        let nb = l.num.max(1);
         let e = st.bars.get(k).map(|b| b.1).unwrap_or(0.0);
         let col = m.bars.get(k).map(|mb| bar_colour(&mb.steel, e)).unwrap_or(Color32::WHITE);
-        let r = ((db / 2.0) * s).max(2.5) as f32;
-        for j in 0..nb {
-            let y = if nb == 1 { 0.0 } else { -inner + 2.0 * inner * j as f64 / (nb - 1) as f64 };
-            let c = map(y, l.z);
+        let r = ((l.draw_dia().max(1.0) / 2.0) * s).max(2.5) as f32;
+        for (y, z) in crate::section_page::bar_draw_points(sec, l) {
+            let c = map(y, z);
             p.circle_filled(c, r, col);
             p.circle_stroke(c, r, Stroke::new(1.0, Color32::BLACK));
         }
