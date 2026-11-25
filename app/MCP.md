@@ -11,7 +11,9 @@ Build the program (`cargo build --release` in `app/`), then point the client at 
 
 * Claude Code: `.mcp.json` at the repository root already registers it (approve the server when
   asked). Section file paths are then relative to the repository root, e.g.
-  `app/shots/cases/mv15.rsp`.
+  `app/shots/cases/mv15.rsp`. It starts the server through `app/tools/mcp.cmd`, which runs a
+  copy of the release exe (`app/target/mcp/`), so `cargo build --release` can replace the exe
+  while the server is running; the copy is refreshed when the server next starts.
 * Claude Desktop and other clients: add a server with command
   `C:\calcs\response-craft\app\target\release\section-response.exe` and args `["--mcp"]`.
 

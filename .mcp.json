@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "section-response": {
-      "command": "app/target/release/section-response.exe",
-      "args": ["--mcp"]
+      "command": "cmd",
+      "args": ["/d", "/c", "app\\tools\\mcp.cmd"]
     }
   }
 }
