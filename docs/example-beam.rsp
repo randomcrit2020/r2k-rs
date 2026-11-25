@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<!DOCTYPE suite_3g SYSTEM "r3g.dtd">
+
+<document>
+	<r3g_beam	name		="Example beam"
+			doneby	=""
+			date		=""	>
+		<concrete	fcp		="35.0"
+				maxagg	="19.0"
+				c_mod		="2"
+				c_soft	="18"
+				t_stiff	="7"
+				name		="Concrete 1"	/>
+		<rebar		fy		="400.0"
+				fu		="600.0"
+				E		="200000"
+				esh		="7.0"
+				eu		="100.0"
+				name		="Steel 1"	/>
+		<rebar		fy		="400.0"
+				fu		="600.0"
+				E		="200000"
+				esh		="7.0"
+				eu		="100.0"
+				name		="Trans"	/>
+		<prestress	fu		="1860.0"
+				E		="200000"
+				A		="0.025"
+				B		="118.0"
+				C		="10.0"
+				eu		="43.0"
+				name		="Low Relax"	/>
+		<sectionSOLID		>
+					600.0	300.0
+					0.0	300.0	"Concrete 1"
+			</sectionSOLID>
+		<shapesection	name		="RECT"
+				par1		="300.0"
+				par2		="600.0"	/>
+		<longreinfx	z		="538.95"
+				type		="Steel 1"
+				space		="0.0"
+				num		="2"
+				A		="600.0"
+				bartitle	="20M"
+				dep		="0.00"
+				fromtop	="1"
+				name		="top"	/>
+		<longreinfx	z		="63.90"
+				type		="Steel 1"
+				space		="0.0"
+				num		="3"
+				A		="1500.0"
+				bartitle	="25M"
+				dep		="0.00"
+				name		="bot"	/>
+		<transreinfz	A		="200.0"
+				type		="Trans"
+				pattern	="3"
+				space		="200.0"
+				disttop	="554.4"
+				distbot	="45.6"
+				bartitle	="10M"
+				db		="11.3"
+				dep		="0.00"
+				name		="stirrup"	/>
+		<sectloading	BN		="0.0"
+				BM		="0.0"
+				BV		="0.0"
+				MN		="0.000"
+				MM		="1.000"
+				MV		="0.000"	/>
+
+	</r3g_beam>
+</document>
