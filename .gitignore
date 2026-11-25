@@ -1,5 +1,6 @@
 # Rust build output
 /app/target/
+/app/target-test/
 
 # Builder agent session transcript (contains account IDs)
 /agent-session.jsonl
