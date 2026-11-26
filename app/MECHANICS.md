@@ -1060,3 +1060,53 @@ curve (Options > Design Factors > ACI 318).
   difference (that view has no menu entry at present). It is kept out of
   `sample_original_runs`. The original's M/V 4 m run (349.3 kNm, V 87.4) also ends while rising
   (shots/orig-mv4.png) but is left as a value: this program is above it (+1.1 %) either way.
+* Early stops at the bars' yield in shear-dominated runs (2026-11-26). A 600 x 600 column (f'c 35,
+  8 x 25M, 15M closed ties @ 250, N = 0) showed a jagged M-V top: with one mesh (40 layers), runs
+  at neighbouring ratios ended either at 622-662 kN, "no balanced state", or at 694-713 kN, "peak
+  passed under curvature control", depending on which side of 0.98 ey the bottom bars were when
+  load control stalled (M/V 0.13 m: 648.9 kN at 1.958 mm/m; 0.125 m: 704.0 kN). Traced causes and
+  changes (path.rs, `load_levels_cap`), each with an off switch:
+  - curvature control was only tried with a tension bar past 0.98 ey. Now, in runs whose moment
+    grows with the load (M/V over 50 mm), when following the drop gets nowhere it is tried as
+    well (SR_NO_CURV_RETRY=1 turns it off);
+  - curvature control stepped the curvature along the last direction of the path, which was
+    sometimes already turning back (shear strain falling as the load rose), so it walked
+    backwards; it now always increases the curvature in its own sense (SR_CURV_TANGENT_SIGN=1);
+  - a curvature-controlled run whose shear fell steadily (3 states or more in a row, 0.5 % or more
+    below its top) before the steps stopped converging ends as a passed peak, confirmed, instead
+    of an unconfirmed "solver stop" whose re-meshing then took the largest of all meshes (often
+    the coarse 30-layer one) (SR_NO_SOFT_PEAK=1);
+  - with a tension bar past 0.9 ey and the web cracked, in runs whose moment grows with the load,
+    a load step that balances at a higher shear while the curvature and the total web shear
+    strain both grow by less than a quarter of the load's relative rise is refused (another root,
+    not the next state on the path: M/V 0.219 m crept from 634 to 648 kN at a constant
+    3.61 rad/km, then stopped; 0.2195 m reached 690.9). Refused steps go to the smaller-step and
+    curvature-control fallbacks from the last good state (SR_NO_STAGNANT=1). Limited to near
+    yield because just after diagonal cracking the web settles for a few steps in the same way,
+    and that is the loading path (M/V 0.10 m fell to 469 kN with the test applied there).
+  Column, one mesh, before -> after: M/V 0.10 m 713.0 -> 713.0, 0.11 661.8 -> 704.2, 0.12 655.7 ->
+  703.4, 0.13 648.9 -> 698.5, 0.15 637.7 -> 690.8, 0.18 622.5 -> 685.8, 0.2 635.9 -> 688,
+  0.219 647.6 -> 690.7. Full diagram (20 points a side): the plateau and dips at 120-230 kNm
+  (649-662 kN between 687 and 670) are gone; the largest kink left is about 2 % (M -153 kNm 700 kN
+  against -111 kNm 688 kN, from re-meshing). --check-mechanics 1.98 -> 1.95 %, 20/20 (strands only
+  M/V 1.5 m -0.64 -> +0.07 %; constant 100 kN shear, moment raised +7.10 -> +6.71 %).
+  Still open: pure shear and M/V 0.053 m end at web crushing that depends on the mesh (40 layers
+  734 / 693 kN, 30-80 layers up to 776 / 741); M/V 0.24-0.29 m stop on curvature control past
+  yield with no layer at capacity (654-670 kN, about 3 % low), left to re-meshing; the end of the
+  diagram near the bending capacity was labelled "web crushing" though it is flexural (fixed in
+  the next entry).
+* Failure labels on M-V points (2026-11-26, path.rs end of `load_levels_cap`; `analysis::mechanism`).
+  The column above had every point from the bending capacity up to the high-shear top labelled
+  "Web crushing". Two causes: the crushing test took any layer with f2 >= 0.85 of its softened
+  strength, which near the bending capacity is the flexural compression zone (principal
+  compression at 0-1 deg, f2 = the axial stress, about f'c); and "web" meant one layer's change of
+  shear strain exceeding the extreme fibre's change of strain over the last step, but a web
+  layer cracked to ex = 30-36 mm/m takes a large shear strain under 0.02 MPa (M/V 11.9 m: 6.4
+  mm/m against 0.04). Now the web governs when the shear does more work than the bending from
+  the state just before the peak to the end of the run (sum of layer shear stress x change of
+  shear strain x area, against M x change of curvature + N x change of centroid strain), and
+  crushing needs an inclined strut (10-80 deg) at 0.85 of its strength. Capacities unchanged
+  (--check-mechanics identical). Column: M/V 0-0.2 m and 0.4 m web crushing (struts at the limit),
+  0.3 and 0.5 m web shear, 0.6 m and up (M 314 kNm and more) bars strain-hardening; sample beam:
+  web shear / crushing for -69 to 213 kNm, bars yielded and then hardening beyond. SR_MECH=1
+  prints the two works and the number of struts at their limit.

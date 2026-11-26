@@ -1178,6 +1178,11 @@ impl Mechanism {
 
 /// Classify the end of a run from its stop reason and its last converged state.
 pub fn mechanism(m: &SModel, sr: &ShearResult) -> Mechanism {
+    // crushing means an inclined strut (10-80 deg from the axis), not the flexural compression zone
+    let strut = |l: &LayerState| {
+        let t = l.theta.to_degrees().abs();
+        t > 10.0 && t < 80.0
+    };
     if let Some(mm) = sr.mech {
         return mm;
     }
@@ -1189,7 +1194,7 @@ pub fn mechanism(m: &SModel, sr: &ShearResult) -> Mechanism {
         let crushed = last
             .layers
             .iter()
-            .any(|l| l.f2 > 0.9 * m.conc.peak(l.e1) && l.v > 0.0);
+            .any(|l| l.f2 > 0.9 * m.conc.peak(l.e1) && l.v > 0.0 && strut(l));
         return if crushed { Mechanism::WebCrushing } else { Mechanism::WebShear };
     }
     // equilibrium not found: is the longitudinal steel the reason?
@@ -1211,7 +1216,7 @@ pub fn mechanism(m: &SModel, sr: &ShearResult) -> Mechanism {
         Mechanism::LongHardening
     } else if yielded {
         Mechanism::LongYield
-    } else if last.layers.iter().any(|l| l.f2 > 0.9 * m.conc.peak(l.e1) && l.v > 0.0) {
+    } else if last.layers.iter().any(|l| l.f2 > 0.9 * m.conc.peak(l.e1) && l.v > 0.0 && strut(l)) {
         Mechanism::WebCrushing
     } else {
         Mechanism::Unclear

@@ -1714,10 +1714,49 @@ fn load_levels_cap(
         let (_, _, g, _, _) = sys.unpack(y);
         g.iter().fold(0.0f64, |a, b| a.max(b.abs()))
     };
+    // Under bending, once the web has cracked, a load step should deform the section: a balanced
+    // state at a higher shear whose curvature and total web shear strain both grew by less than a
+    // quarter of the load's own relative rise (or fell) is another root of the equations, not the
+    // next state on the loading path. Taking it walks the run onto a branch that ends in a false
+    // stop (a 600 x 600 column at M/V 0.219 m: V 634 -> 648 kN at a constant 3.61 rad/km, then
+    // no continuation, against 690 kN at M/V 0.2195 m).
+    // (only where the moment grows with the load: with the moment held, the curvature need not grow)
+    let bending_run = sys.lo.dm.abs() > 50.0;
+    let no_stagnant = std::env::var("SR_NO_STAGNANT").is_ok();
+    let stagnant = |a: &[f64], b: &[f64]| -> bool {
+        if no_stagnant || !bending_run || gmax_of(a) < 1e-3 {
+            return false;
+        }
+        let (v0, v1) = (a[iv], b[iv]);
+        if v0 <= 0.0 || v1 <= v0 {
+            return false;
+        }
+        let rise = (v1 - v0) / v1;
+        let (ec0, phi0, g0, _, _) = sys.unpack(a);
+        let (_, phi1, g1, _, _) = sys.unpack(b);
+        if phi1.abs() < 1e-12 {
+            return false;
+        }
+        // only next to the tension bars' yield, where it was seen; just after diagonal cracking
+        // the web settles for a few steps (curvature and shear strain easing back as the load
+        // creeps up) and that is the loading path
+        let near_yield = m.bars.iter().any(|b| {
+            let e = m.strain(ec0, phi0, b.z) + b.pre;
+            let tension_side = -(b.z - m.zc) * phi0.signum() > 0.0;
+            tension_side && e > 0.9 * b.steel.fy() / b.steel.modulus()
+        });
+        if !near_yield {
+            return false;
+        }
+        let dphi = (phi1 - phi0) * phi1.signum() / phi1.abs();
+        let (s0, s1): (f64, f64) = (g0.iter().map(|x| x.abs()).sum(), g1.iter().map(|x| x.abs()).sum());
+        let dg = (s1 - s0) / s1.max(1e-12);
+        dphi < 0.25 * rise && dg < 0.25 * rise
+    };
     let mut steps = 0;
     let mut drops = 0;
     let mut peak_state: Option<SectionState> = None;
-    loop {
+    'levels: loop {
         steps += 1;
         if steps > 600 {
             res.reason = "Step limit reached.".into();
@@ -1749,6 +1788,14 @@ fn load_levels_cap(
                 continue;
             }
         }
+        // a step that carries more load without deforming more is not on the loading path
+        if found.as_ref().map(|c| stagnant(&yk, &c.0)).unwrap_or(false) {
+            if dv > 4.0 * dv_min {
+                dv *= 0.5;
+                continue;
+            }
+            found = None;
+        }
         if found.is_none() && dv > 4.0 * dv_min {
             // try a smaller step before looking for a jump
             dv *= 0.5;
@@ -1772,7 +1819,7 @@ fn load_levels_cap(
                 if std::env::var("SR_CAND").is_ok() {
                     eprintln!("   cand branch guess -> {}", got.as_ref().map(|c| format!("gmax {:.5}", gmax_of(&c.0))).unwrap_or("none".into()));
                 }
-                if let Some(c) = got.filter(|c| gmax_of(&c.0) <= 0.025) {
+                if let Some(c) = got.filter(|c| gmax_of(&c.0) <= 0.025 && !stagnant(&yk, &c.0)) {
                     res.rescued += 1;
                     found = Some(c);
                 }
@@ -1802,7 +1849,7 @@ fn load_levels_cap(
                         eprintln!("   cand family {} x{} -> {}", family, f, got.as_ref().map(|c| format!("gmax {:.5}", gmax_of(&c.0))).unwrap_or("none".into()));
                     }
                     if let Some(c) = got {
-                        if gmax_of(&c.0) > 0.025 {
+                        if gmax_of(&c.0) > 0.025 || stagnant(&yk, &c.0) {
                             continue; // one layer run away: not the shared branch
                         }
                         cands.push(c);
@@ -1829,170 +1876,203 @@ fn load_levels_cap(
         let mut dropped = false;
         if found.is_none() && dv * 0.5 < dv_min && drops < 3 && cap.is_none() {
             let v_before = yk[iv];
-            let (mut yd, mut td, mut qd) = (yk.clone(), tk.clone(), q.clone());
-            let mut pts: Vec<SectionState> = vec![];
-            let mut dd = 0.02;
-            let mut back = false;
             // on the bars' yield plateau the moment can't rise until they harden: the curvature
             // is the quantity to drive then (as a curvature-controlled bending test does)
             // (only bars on the tension side of the bending count, and only when the moment
             // grows with the load: in pure shear the curvature isn't what drives the section)
             let (_, phi_now, _, _, _) = sys.unpack(&yk);
             let bending = sys.lo.dm.abs() > 50.0 || sys.lo.m0.abs() > 0.0;
-            let yielded = bending
+            let yielded_now = bending
                 && res.points.last().map(|p| {
                     p.bars.iter().zip(&m.bars).any(|(b, mb)| {
                         let tension_side = -(mb.z - m.zc) * phi_now.signum() > 0.0;
                         tension_side && b.1 > 0.98 * mb.steel.fy() / mb.steel.modulus()
                     })
                 }).unwrap_or(false);
-            let mut vmax_f = v_before;
-            let mut curv_end: Option<&str> = None;
-            for _ in 0..(if yielded { 400 } else { 120 }) {
-                let mut j = 2;
-                for k in 2..2 + 2 * nl {
-                    if td[k].abs() > td[j].abs() {
-                        j = k;
+            // A stall under bending with the bars just short of yield (or with the stirrups
+            // yielded and the strut carrying more) is the same situation: load control can't find
+            // the next state on a nearly flat path, but curvature control can. When following
+            // the drop gets nowhere, curvature control is tried too, so neighbouring ratios do
+            // not end at different loads depending on which side of the yield strain they
+            // stalled (a 600 x 600 column: 622-662 kN stops against 694-713 kN peaks).
+            let modes: &[bool] = if yielded_now {
+                &[true]
+            } else if sys.lo.dm.abs() > 50.0 && std::env::var("SR_NO_CURV_RETRY").is_err() {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for &yielded in modes {
+                let (mut yd, mut td, mut qd) = (yk.clone(), tk.clone(), q.clone());
+                let mut pts: Vec<SectionState> = vec![];
+                let mut dd = 0.02;
+                let mut back = false;
+                let mut vmax_f = v_before;
+                let mut curv_end: Option<&str> = None;
+                for _ in 0..(if yielded { 400 } else { 120 }) {
+                    let mut j = 2;
+                    for k in 2..2 + 2 * nl {
+                        if td[k].abs() > td[j].abs() {
+                            j = k;
+                        }
                     }
-                }
-                if yielded {
-                    j = 1;
-                }
-                let mut w = vec![0.0; nu];
-                w[j] = 1.0;
-                let tgt = if td[j] < 0.0 { -dd } else { dd };
-                let pred: Vec<f64> = if td[j].abs() > 0.05 {
-                    yd.iter().zip(&td).map(|(y, t)| y + tgt / td[j] * t).collect()
-                } else {
-                    let mut p = yd.clone();
-                    p[j] += tgt;
-                    p
-                };
-                // distance along the path first (it can turn back through a snap-back), the
-                // crack's own strain second
-                let arc_pred: Vec<f64> = yd.iter().zip(&td).map(|(y, t)| y + dd * t).collect();
-                let got = if yielded {
-                    REL_TOL.with(|c| c.set(true));
-                    let g = solve_with_flow(sys, &yd, &w, tgt, &pred, &qd).or_else(|| solve_with_flow(sys, &yd, &td, dd, &arc_pred, &qd));
-                    REL_TOL.with(|c| c.set(false));
-                    g
-                } else {
-                    solve_with_flow(sys, &yd, &td, dd, &arc_pred, &qd).or_else(|| solve_with_flow(sys, &yd, &w, tgt, &pred, &qd))
-                };
-                match got {
-                    Some((y, ev, qn)) => {
-                        let dy: Vec<f64> = y.iter().zip(&yd).map(|(a, b)| a - b).collect();
-                        let n = norm2(&dy).max(1e-300);
-                        td = dy.iter().map(|d| d / n).collect();
-                        let st = state_of(sys, &y, &ev, n_kn);
-                        if std::env::var("SR_PATH").is_ok() {
-                            let bmax = ev.bar_e.iter().fold(0.0f64, |a, b| a.max(*b));
-                            eprintln!("   drop: V {:.2} kN M {:.1} phi {:.2} rad/km bar {:.2} mm/m gmax {:.5} dd {:.4} (unknown {})", st.v, st.m, st.phi, bmax * 1e3, gmax_of(&y), dd, j);
-                        }
-                        let broken = m.bars.iter().zip(&ev.bar_e).any(|(b, e)| e.abs() >= b.steel.eu())
-                            || gmax_of(&y) > 0.025
-                            || st.layers.iter().any(|l| l.ex < -0.012);
-                        yd = y;
-                        qd = qn;
-                        pts.push(st);
-                        if broken {
-                            curv_end = Some(if gmax_of(&yd) > 0.025 {
-                                "Very large shear strain reached (25 mm/m)."
-                            } else if pts.last().map(|p| p.layers.iter().any(|l| l.ex < -0.012)).unwrap_or(false) {
-                                "Concrete strain limit reached."
-                            } else {
-                                "Reinforcement fractured."
-                            });
-                            break;
-                        }
-                        vmax_f = vmax_f.max(yd[iv]);
-                        if yielded {
-                            // stay on curvature control past the plateau until the shear has
-                            // clearly passed its peak
-                            if yd[iv] < 0.85 * vmax_f {
-                                curv_end = Some("Peak passed under curvature control (the shear fell while the bending kept growing).");
+                    if yielded {
+                        j = 1;
+                    }
+                    let mut w = vec![0.0; nu];
+                    w[j] = 1.0;
+                    // under curvature control the bending only grows: the curvature is driven the
+                    // way it already points, even when the last load-controlled steps were
+                    // turning back along the path (shear strain falling as the load rose)
+                    let tgt = if yielded && phi_now != 0.0 && std::env::var("SR_CURV_TANGENT_SIGN").is_err() {
+                        dd * phi_now.signum()
+                    } else if td[j] < 0.0 {
+                        -dd
+                    } else {
+                        dd
+                    };
+                    let pred: Vec<f64> = if td[j].abs() > 0.05 {
+                        yd.iter().zip(&td).map(|(y, t)| y + tgt / td[j] * t).collect()
+                    } else {
+                        let mut p = yd.clone();
+                        p[j] += tgt;
+                        p
+                    };
+                    // distance along the path first (it can turn back through a snap-back), the
+                    // crack's own strain second
+                    let arc_pred: Vec<f64> = yd.iter().zip(&td).map(|(y, t)| y + dd * t).collect();
+                    let got = if yielded {
+                        REL_TOL.with(|c| c.set(true));
+                        let g = solve_with_flow(sys, &yd, &w, tgt, &pred, &qd).or_else(|| solve_with_flow(sys, &yd, &td, dd, &arc_pred, &qd));
+                        REL_TOL.with(|c| c.set(false));
+                        g
+                    } else {
+                        solve_with_flow(sys, &yd, &td, dd, &arc_pred, &qd).or_else(|| solve_with_flow(sys, &yd, &w, tgt, &pred, &qd))
+                    };
+                    match got {
+                        Some((y, ev, qn)) => {
+                            let dy: Vec<f64> = y.iter().zip(&yd).map(|(a, b)| a - b).collect();
+                            let n = norm2(&dy).max(1e-300);
+                            td = dy.iter().map(|d| d / n).collect();
+                            let st = state_of(sys, &y, &ev, n_kn);
+                            if std::env::var("SR_PATH").is_ok() {
+                                let bmax = ev.bar_e.iter().fold(0.0f64, |a, b| a.max(*b));
+                                eprintln!("   drop: V {:.2} kN M {:.1} phi {:.2} rad/km bar {:.2} mm/m gmax {:.5} dd {:.4} (unknown {})", st.v, st.m, st.phi, bmax * 1e3, gmax_of(&y), dd, j);
+                            }
+                            let broken = m.bars.iter().zip(&ev.bar_e).any(|(b, e)| e.abs() >= b.steel.eu())
+                                || gmax_of(&y) > 0.025
+                                || st.layers.iter().any(|l| l.ex < -0.012);
+                            yd = y;
+                            qd = qn;
+                            pts.push(st);
+                            if broken {
+                                curv_end = Some(if gmax_of(&yd) > 0.025 {
+                                    "Very large shear strain reached (25 mm/m)."
+                                } else if pts.last().map(|p| p.layers.iter().any(|l| l.ex < -0.012)).unwrap_or(false) {
+                                    "Concrete strain limit reached."
+                                } else {
+                                    "Reinforcement fractured."
+                                });
                                 break;
                             }
-                            dd = (dd * 1.3).min(0.5);
-                            continue;
-                        }
-                        if yd[iv] > v_before {
-                            back = true;
-                            break;
-                        }
-                        dd = (dd * 1.3).min(if yielded { 0.5 } else { 0.06 });
-                    }
-                    None => {
-                        if std::env::var("SR_PATH").is_ok() {
-                            eprintln!("   drop: step dd {:.4} failed", dd);
-                        }
-                        dd *= 0.5;
-                        if dd < 1e-3 {
-                            break;
-                        }
-                    }
-                }
-            }
-            if yielded && !pts.is_empty() {
-                // the run ends on curvature control: its states join the path, and the
-                // capacity is the highest shear reached before or during it
-                if std::env::var("SR_PATH").is_ok() {
-                    eprintln!("   curvature control past yield: {} states, top V {:.1} kN", pts.len(), vmax_f / sys.scale[iv] / 1000.0);
-                }
-                res.points.extend(pts);
-                peak_state = res.points.last().cloned();
-                res.rescued += 1;
-                match curv_end {
-                    Some(t) => {
-                        res.reason = t.into();
-                        res.confirmed = true;
-                    }
-                    None => {
-                        // no balance a little further on: a real failure if some layer already
-                        // carries all the shear it can (no larger stress at any larger strain)
-                        let (_, ev_end) = sys.resid(&yd, &qd);
-                        match layer_at_capacity(sys, &yd, &ev_end) {
-                            Some((i, tau, top)) => {
-                                if std::env::var("SR_PATH").is_ok() {
-                                    eprintln!("   layer {} at z {:.0} carries {:.2} MPa, at most {:.2}: real failure", i, m.layers[i].z, tau, top);
+                            vmax_f = vmax_f.max(yd[iv]);
+                            if yielded {
+                                // stay on curvature control past the plateau until the shear has
+                                // clearly passed its peak
+                                if yd[iv] < 0.85 * vmax_f {
+                                    curv_end = Some("Peak passed under curvature control (the shear fell while the bending kept growing).");
+                                    break;
                                 }
-                                res.reason = format!(
-                                    "Shear capacity of the concrete at z = {:.0} mm reached{} past the bars' yield.",
-                                    m.layers[i].z,
-                                    if m.layers[i].rho_z > 0.0 { "" } else { " (outside the stirrups)" }
-                                );
-                                res.confirmed = true;
+                                dd = (dd * 1.3).min(0.5);
+                                continue;
                             }
-                            None => {
-                                res.reason = "Curvature control past yield could not be continued (solver stop).".into();
-                                res.confirmed = false;
+                            if yd[iv] > v_before {
+                                back = true;
+                                break;
+                            }
+                            dd = (dd * 1.3).min(if yielded { 0.5 } else { 0.06 });
+                        }
+                        None => {
+                            if std::env::var("SR_PATH").is_ok() {
+                                eprintln!("   drop: step dd {:.4} failed", dd);
+                            }
+                            dd *= 0.5;
+                            if dd < 1e-3 {
+                                break;
                             }
                         }
                     }
                 }
-                break;
-            }
-            // even when the load hasn't come back yet, carry on from the most cracked state the
-            // drop reached: load control and its jumps start afresh from there
-            let adopt = !back && !pts.is_empty() && gmax_of(&yd) > 1.05 * gmax_of(&yk);
-            if back || adopt {
-                if std::env::var("SR_PATH").is_ok() {
-                    eprintln!("   load drop followed, reloading past {:.1} kN", pts.last().map(|p| p.v).unwrap_or(0.0));
+                if yielded && !pts.is_empty() {
+                    // the run ends on curvature control: its states join the path, and the
+                    // capacity is the highest shear reached before or during it
+                    if std::env::var("SR_PATH").is_ok() {
+                        eprintln!("   curvature control past yield: {} states, top V {:.1} kN", pts.len(), vmax_f / sys.scale[iv] / 1000.0);
+                    }
+                    // a peak already passed: the shear fell steadily (3 or more states in a row,
+                    // 0.5 % or more below the top) while the curvature kept growing
+                    let falling = pts.windows(2).rev().take_while(|w| w[1].v < w[0].v).count();
+                    let passed = falling >= 3
+                        && yd[iv] < 0.995 * vmax_f
+                        && std::env::var("SR_NO_SOFT_PEAK").is_err();
+                    res.points.extend(pts);
+                    peak_state = res.points.last().cloned();
+                    res.rescued += 1;
+                    if curv_end.is_none() && passed {
+                        curv_end = Some("Peak passed under curvature control (the shear fell while the bending kept growing).");
+                    }
+                    match curv_end {
+                        Some(t) => {
+                            res.reason = t.into();
+                            res.confirmed = true;
+                        }
+                        None => {
+                            // no balance a little further on: a real failure if some layer already
+                            // carries all the shear it can (no larger stress at any larger strain)
+                            let (_, ev_end) = sys.resid(&yd, &qd);
+                            match layer_at_capacity(sys, &yd, &ev_end) {
+                                Some((i, tau, top)) => {
+                                    if std::env::var("SR_PATH").is_ok() {
+                                        eprintln!("   layer {} at z {:.0} carries {:.2} MPa, at most {:.2}: real failure", i, m.layers[i].z, tau, top);
+                                    }
+                                    res.reason = format!(
+                                        "Shear capacity of the concrete at z = {:.0} mm reached{} past the bars' yield.",
+                                        m.layers[i].z,
+                                        if m.layers[i].rho_z > 0.0 { "" } else { " (outside the stirrups)" }
+                                    );
+                                    res.confirmed = true;
+                                }
+                                None => {
+                                    res.reason = "Curvature control past yield could not be continued (solver stop).".into();
+                                    res.confirmed = false;
+                                }
+                            }
+                        }
+                    }
+                    break 'levels;
                 }
-                let last = pts.pop();
-                res.points.extend(pts);
-                if let Some(st) = last {
-                    res.points.push(st.clone());
-                    peak_state = Some(st);
+                // even when the load hasn't come back yet, carry on from the most cracked state the
+                // drop reached: load control and its jumps start afresh from there
+                let adopt = !back && !pts.is_empty() && gmax_of(&yd) > 1.05 * gmax_of(&yk);
+                if back || adopt {
+                    if std::env::var("SR_PATH").is_ok() {
+                        eprintln!("   load drop followed, reloading past {:.1} kN", pts.last().map(|p| p.v).unwrap_or(0.0));
+                    }
+                    let last = pts.pop();
+                    res.points.extend(pts);
+                    if let Some(st) = last {
+                        res.points.push(st.clone());
+                        peak_state = Some(st);
+                    }
+                    tk = td;
+                    yk = yd;
+                    q = qd;
+                    drops += 1;
+                    dropped = true;
+                    res.rescued += 1;
+                    dv = 0.02;
+                    continue 'levels;
                 }
-                tk = td;
-                yk = yd;
-                q = qd;
-                drops += 1;
-                dropped = true;
-                res.rescued += 1;
-                dv = 0.02;
-                continue;
             }
         }
         match found {
@@ -2007,7 +2087,7 @@ fn load_levels_cap(
             Some((y, ev, qn)) => {
                 let st = state_of(sys, &y, &ev, n_kn);
                 if std::env::var("SR_PATH").is_ok() {
-                    eprintln!("level {} dv {:.4} V {:.2} kN M {:.2} gmax {:.6}", steps, dv, st.v, st.m, gmax_of(&y));
+                    eprintln!("level {} dv {:.4} V {:.2} kN M {:.2} phi {:.3} gmax {:.6} gsum {:.5} bar {:.3}", steps, dv, st.v, st.m, st.phi, gmax_of(&y), st.layers.iter().map(|l| l.gamma.abs()).sum::<f64>(), ev.bar_e.iter().fold(0.0f64, |a, b| a.max(*b)) * 1e3);
                 }
                 let dy: Vec<f64> = y.iter().zip(&yk).map(|(a, b)| a - b).collect();
                 let n = norm2(&dy).max(1e-300);
@@ -2037,18 +2117,55 @@ fn load_levels_cap(
             }
         }
     }
-    // what governs: compare the last two states (the direction the section was moving in)
+    // What governs: the work done on the section from just before the peak to the end of the run,
+    // by the shear (layer shear stress x change of its shear strain) against the bending
+    // (moment x change of curvature, plus axial force x change of centroid strain). One layer's
+    // shear strain against the extreme fibre's strain, as compared before, called bending
+    // failures web failures: once a web layer is cracked wide (ex 30 mm/m and more, near the
+    // bending capacity) a tiny shear stress gives it a large shear strain that carries no load.
+    // Crushing counts only an inclined strut (principal compression 10-80 deg from the axis),
+    // not the flexural compression zone (about 0 deg, f2 = the axial stress).
     if let Some(pk) = peak_state {
         let n = res.points.len();
-        let prev = if n >= 2 { Some(&res.points[n - 2]) } else { None };
+        let ipk = res
+            .points
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.v.partial_cmp(&b.1.v).unwrap())
+            .map(|(i, _)| i)
+            .unwrap_or(n.saturating_sub(1));
+        let base = ipk.saturating_sub(1).min(n.saturating_sub(2));
+        let prev = if n >= 2 { Some(&res.points[base]) } else { None };
         let mut web = false;
         let mut crush = false;
         if let Some(p) = prev {
-            let dgam: f64 = pk.layers.iter().zip(&p.layers).map(|(a, b)| (a.gamma - b.gamma).abs()).fold(0.0, f64::max);
-            let dphi = (pk.phi - p.phi).abs() / 1e6 * m.h / 2.0;
-            web = dgam > dphi;
+            let w_shear: f64 = pk
+                .layers
+                .iter()
+                .zip(&p.layers)
+                .zip(&m.layers)
+                .map(|((a, b), l)| 0.5 * (a.v.abs() + b.v.abs()) * (a.gamma - b.gamma).abs() * l.b * l.t)
+                .sum();
+            let w_bend = 0.5 * (pk.m.abs() + p.m.abs()) * (pk.phi - p.phi).abs()
+                + 0.5 * (pk.n.abs() + p.n.abs()) * 1000.0 * (pk.ec - p.ec).abs();
+            web = w_shear > w_bend;
+            let inclined = |l: &LayerState| {
+                let t = l.theta.to_degrees().abs();
+                t > 10.0 && t < 80.0
+            };
+            if std::env::var("SR_MECH").is_ok() {
+                eprintln!(
+                    "   mech: shear work {:.1} N, bending work {:.1} N (states {} -> {} of {}), struts at their limit: {}",
+                    w_shear,
+                    w_bend,
+                    base,
+                    n - 1,
+                    n,
+                    pk.layers.iter().filter(|l| inclined(l) && l.f2 >= 0.85 * m.conc.peak(l.e1)).count()
+                );
+            }
             if web {
-                crush = pk.layers.iter().any(|l| l.f2 >= 0.85 * m.conc.peak(l.e1));
+                crush = pk.layers.iter().any(|l| inclined(l) && l.f2 >= 0.85 * m.conc.peak(l.e1));
             }
         }
         let mech = if web {
