@@ -1,14 +1,17 @@
 # Section Response
 
 Sectional analysis of reinforced and prestressed concrete members using the Modified
-Compression Field Theory (in the manner of Response-2000). A Windows desktop app written in Rust.
+Compression Field Theory (in the manner of Response-2000). A desktop app for Windows and Linux,
+written in Rust.
 
 ## Get it
 
-- **Download:** the latest `section-response-…-windows-x64.zip` from
-  [Releases](https://github.com/randomcrit2020/r2k-rs/releases). Unzip it and run
-  `section-response.exe`. There is no installer.
-- **Build from source** (Rust stable, MSVC toolchain):
+- **Download:** the latest build from
+  [Releases](https://github.com/randomcrit2020/r2k-rs/releases). There is no installer.
+  - Windows: `section-response-…-windows-x64.zip` — unzip it and run `section-response.exe`.
+  - Linux: `section-response-…-linux-x64.tar.gz` — unpack it and run `./section-response`
+    (x86-64, glibc 2.28 or newer).
+- **Build from source** (Rust stable; the MSVC toolchain on Windows):
 
   ```powershell
   cd app
