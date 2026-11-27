@@ -839,6 +839,35 @@ impl Section {
         }
     }
 
+    /// The section is the same upside down (within 0.1 mm and 0.1 % of an area): outline, bar
+    /// layers and stirrup zone mirror about mid-height. Used only to measure how closely the
+    /// solvers agree between positive and negative moment (`--bench-mv`); results are never
+    /// copied from one side to the other.
+    pub fn is_symmetric(&self) -> bool {
+        let h = self.height();
+        if h <= 0.0 {
+            return false;
+        }
+        let tol = 0.1;
+        let mut zs: Vec<f64> = (0..=40).map(|i| h * i as f64 / 80.0).collect();
+        zs.extend(self.outline.iter().flat_map(|p| [p.0 + 0.2, p.0 - 0.2]).filter(|z| *z > 0.0 && *z < h));
+        if zs.iter().any(|&z| (self.width_at(z) - self.width_at(h - z)).abs() > tol) {
+            return false;
+        }
+        let twin = |l: &LongLayer| {
+            self.long.iter().any(|o| {
+                (o.z - (h - l.z)).abs() <= tol && (o.area - l.area).abs() <= 1e-3 * l.area.max(1.0) && o.steel == l.steel && (o.dep - l.dep).abs() < 1e-9 && o.num == l.num
+            })
+        };
+        if !self.long.iter().all(twin) {
+            return false;
+        }
+        match &self.stirrups {
+            Some(s) => (s.z_top + s.z_bot - h).abs() <= 2.0 * tol,
+            None => true,
+        }
+    }
+
     pub fn height(&self) -> f64 {
         self.outline.iter().map(|p| p.0).fold(0.0, f64::max)
     }

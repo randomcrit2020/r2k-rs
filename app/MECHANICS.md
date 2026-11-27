@@ -1110,3 +1110,610 @@ curve (Options > Design Factors > ACI 318).
   0.3 and 0.5 m web shear, 0.6 m and up (M 314 kNm and more) bars strain-hardening; sample beam:
   web shear / crushing for -69 to 213 kNm, bars yielded and then hardening beyond. SR_MECH=1
   prints the two works and the number of struts at their limit.
+* Stability, speed and the `--bench-mv` / `--bench-sym` measures (2026-11-26). Aims set by the
+  owner: accurate results and failure labels; stable results (a symmetric section solved
+  independently for positive and negative moment must give nearly the same curve - results are
+  never mirrored); speed as a core requirement. Two commands measure them, to be run with
+  `--check-mechanics` before and after any solver change:
+  - `--bench-mv [points] [files]`: full M-V diagrams (default: sample beam, the 600 x 600 column
+    shots/cases/col600.rsp, the 16-bar circle, the prestressed T-beam): wall time, unconfirmed and
+    inside points, dents in the envelope (how far a point falls short of the chord between its
+    neighbours, along its own direction), and for symmetric sections the difference between the
+    positive side and the mirrored negative side.
+  - `--bench-sym file [points]`: every M/V ratio on one mesh in both orientations, side by side
+    (SR_SYM_ONLY=k one ratio; SR_LMSTAT=1 the corrector's outcomes and times).
+  What the one-mesh comparison showed (column, 29 ratios): the two orientations agreed within
+  0.4 % wherever both runs ended at a real limit; every larger difference had one side ending in
+  a solver stop. Causes found and changed (path.rs), each with an off switch:
+  - the branch-guess rescue was limited to states before any bar's yield, because it had carried
+    "constant 100 kN shear, moment raised" past the original's 328 kNm - later shown to be the
+    original stopping early. Now used after yield too (SR_BRANCH_PRE_YIELD_ONLY=1). M/V 0.56 m:
+    516.2 / 546.5 kN -> 546.5 / 546.5.
+  - curvature control: where the steps shrink to nothing the corrector settles with the moment
+    out of balance by a fixed amount (a narrow band of curvature with no balanced state, a layer
+    crossing its cracking dip); larger steps are then tried to get past it (SR_NO_HOP=1).
+    M/V 0.222 m: 677.4 / 691.1 -> 691.5 / 691.1.
+  - the "slow decline is a passed peak" rule no longer applies while a tension bar is on its
+    yield plateau (the shear sags along the plateau and rises again with strain hardening:
+    M/V 0.70 m 478.5 / 489.8 -> 495.0 / 490.6).
+  - a falling branch that reaches a failure limit (25 mm/m, crushing, fracture) ends the run;
+    before, that state was adopted and reloaded, retracing the branch backwards onto other peaks
+    (pure shear 728, 734, 752 kN by cycle) (SR_RELOAD_BROKEN=1).
+  - shear-only runs get the counterpart of curvature control: all working web layers' shear
+    strains driven forward together (SR_NO_SHEAR_DRIVE=1); and driving the whole section now
+    comes before following one layer's strain (SR_DROP_FIRST=1).
+  - convergence: the layers' shear errors, added with their signs, must be within one layer's
+    band; before, each layer could be inside its band while the sum was off by up to 1.3 % of
+    the shear scale, so one deformation balanced a range of loads (60 layers: 750.0 and 754.6 kN
+    at the same state) (SR_NO_SUM_TOL=1). Pure shear by mesh, before -> after: 40 layers 734 ->
+    731.7, 60 layers 760 -> 744.2, 80 layers 770 -> 747.3, both orientations equal on each.
+    Tightening the whole band (SR_TOLK=0.5, 0.25) was tried and dropped: more solver stops.
+  Speed (column, 58 runs, summed solver time 62.5 -> 30.6 s):
+  - failed corrector calls took 31 s of the corrector's 41 s (9 700 calls, 85 % running all 40
+    iterations). A call is given up from iteration 12 on when its merit is still above 1e4 and
+    has not halved in 8 iterations: ends 5 700 of them early, would have ended 8 of the 20 800
+    that converged; results unchanged at every ratio (SR_NO_LM_EARLY=1).
+  - the slope matrix takes 3 section evaluations instead of 6: the state's own evaluation is
+    passed in, the load column is exact (the loads are linear in the load factor), and the
+    centroid-strain and curvature columns come from one evaluation of d/d ex per layer by the
+    chain rule (SR_JAC_PLAIN=1; the plain columns are kept when the longitudinal reserve is on).
+  - pure shear, run first and alone to space the ratios, 3.4 -> 0.4 s (no reload cycles).
+  Failure labels: the bars' state (yielded / strain-hardening) is read at the peak load, not at
+  the end of the run (sample beam: 11 -> 7 points "strain-hardening").
+  Measured, before -> after (20 points a side):
+  | section | time s | asym max | asym mean | dent max | unconfirmed |
+  |---|---|---|---|---|---|
+  | sample beam | 11.2 -> 9.5 | - | - | 3.99 -> 4.06 % | 0 -> 4 |
+  | column 600 | 10.7 -> 4.2 | 2.25 -> 0.42 % | 0.25 -> 0.04 % | 2.36 -> 2.96 % | 0 -> 0 |
+  | circle 16 bars | 48.3 -> 14.9 | 2.37 -> 2.25 % | 0.19 -> 0.17 % | 4.17 -> 3.33 % | 2 -> 0 |
+  | T-beam | 34.3 -> 15.8 | - | - | 3.41 -> 4.11 % | 4 -> 4 |
+  Total 104.5 -> 44.5 s. --check-mechanics 1.95 -> 2.05 %, 20/20 (N = -6000 kN shear +4.19 ->
+  +1.70 %; constant 100 kNm, shear raised +0.41 -> -2.26 %; M/V 1.5 m -5.97 -> -6.92 %): the
+  shear-sum check removed loads that had been accepted on tolerance, which lowers a few runs.
+  Still open: the circle's two sides differ by up to 2.25 %; envelope dents of 3-4 % remain on
+  all four sections (column: 705.7 kN at M/V 0.036 m under shear-strain control between 731.7
+  and 723.0); the sample beam has 4 unconfirmed points where it had none; M/V 0.31 m on the
+  column still ends in a curvature-control solver stop on one side; the pure-shear capacity
+  still moves 2 % between 40 and 80 layers.
+* Second pass on stability and speed (2026-11-26, after the entry above). Traced with
+  `--bench-sym` on the 16-bar circle and the column:
+  - The fallbacks after a stalled load step are now explicit modes tried in order: (1) the whole
+    section driven by its curvature (bending runs), (2) driven by the shear strains of all its
+    working web layers, (3) following the one fastest-changing layer. A driven step must move
+    its driven quantity forward: the fall-back "distance along the path" is refused when the
+    curvature (or the web's shear strain) went backwards with it - "curvature control" had been
+    following falling branches with the curvature decreasing (circle, M/V 0.26 m: 4.83 -> 4.53
+    rad/km). A driven mode that ends without proof of failure hands its last state to the next
+    driven mode, so a bending run whose web fails is carried past its peak by the shear strains
+    (SR_ONE_DRIVE=1: no hand-over; SR_DRIVE_ANY_WAY=1: the old fall-back).
+  - The cracking rescue (`branch_guess`) is tried before a failed load step is halved, with the
+    present strain plane only (no curvature-jump starts) and not allowed a jump of more than
+    twice the largest shear strain (SR_HALVE_FIRST=1: the earlier order). While a web cracks
+    layer by layer every step over about 0.4 kN had failed and been halved (circle, M/V 0.05 m:
+    136 load steps for 50 kN, 4 s). Tried with all six starts first: results steadier still
+    (column: both orientations within 0.42 % at every ratio, mean 0.02 %) but 224 failed calls
+    took 50 s, 225 ms each; with the plain start only a failed call costs 29 ms.
+  - Tried and dropped: the load-controlled rescue's further-deformed guesses on the
+    curvature-controlled step-over (no result changed, column solver time 33 -> 44 s).
+  - `--bench-mv` with SR_BENCH_DENTS=1 lists every dent over 1 % with its point and neighbours.
+  One mesh, both orientations (29 ratios), start of the day -> after the first pass -> now:
+  column largest 5.54 -> 0.88 -> 1.93 % (one ratio; the rest within 0.42 %), mean 0.31 -> 0.12
+  -> 0.08 %; circle largest 2.85 -> 0.72 %, mean 0.26 -> 0.04 % (first measured after the first
+  pass). Full diagrams, 20 points a side, start of the day -> now:
+  | section | time s | asym max | asym mean | dent max | unconfirmed |
+  |---|---|---|---|---|---|
+  | sample beam | 11.2 -> 9.2 | - | - | 3.99 -> 4.05 % | 0 -> 0 |
+  | column 600 | 10.7 -> 5.3 | 2.25 -> 0.41 % | 0.25 -> 0.03 % | 2.36 -> 0.88 % | 0 -> 0 |
+  | circle 16 bars | 48.3 -> 6.2 | 2.37 -> 1.07 % | 0.19 -> 0.07 % | 4.17 -> 3.29 % | 2 -> 0 |
+  | T-beam | 34.3 -> 11.5 | - | - | 3.41 -> 3.42 % | 4 -> 1 |
+  Total 104.5 -> 32.3 s. --check-mechanics 1.95 -> 1.84 %, 20/20 (shear at N = -6000 kN +4.19
+  -> +0.15 %; constant 100 kNm, shear raised +0.41 -> -0.29 %; M/V 1.5 m -5.97 -> -6.70 %;
+  shear only -2.54 -> -2.95 %).
+  Still open: the dents left sit next to pure shear and appear on both sides alike (circle: 346
+  kN at +-28 kNm between 344 at M = 0 and 389 at +-60; sample beam at -26 and 0 kNm; T-beam at
+  45 kNm), so they may be the model's own shape where a compression zone starts to form, not
+  early stops - not yet settled; circle M/V 0.26 m: two balanced states near one load (399.5 /
+  408 kN), now both orientations take the lower; column M/V 1.25 m 345.9 / 339.2 kN; the
+  largest differences from the original are unchanged in kind (M/V 0.6 m +10.6 %, prestressed
+  T-beam M/V 1.5 m -7.0 %, M/V 1.5 m -6.7 %).
+* Are the dents next to pure shear real? (2026-11-26) `--bench-sweep file a_max n [layers]` runs
+  evenly spaced M/V ratios from -a_max to +a_max on one mesh (SR_SWEEP_ONLY=a: one ratio, for
+  tracing). Sweeps on 40 and 80 layers:
+  - Circle, 16 bars: real. V is flat at 344 kN from M/V 0 to 0.05 m, 335-338 at 0.06-0.07 m,
+    then rises steadily to 395-397 at 0.20 m; the two meshes agree within 1 % at 18 of 19
+    ratios (0.12 m: 381.6 / 370.8), and nothing changes where the control switches at 0.05 m
+    (343.6 on both sides of it). The envelope is flat and then rising, which the dent measure
+    (a point short of the chord between its neighbours) reads as a dent at +-28 kNm.
+  - Sample beam: the "dent" at M = 0 is real - V rises in a nearly straight line from 262 kN at
+    M/V -0.16 m through 310 at 0 to 361 at +0.16 m (about 0.3 kN per mm), on both meshes. The
+    one at -26 kNm was not: a step of 12 kN at M/V -0.105 m (40 layers: 280.3 at -0.11 m, 268.4
+    at -0.10 m; 80 layers the same step one ratio over). Cause: the "no load without
+    deformation" filter of the first entry of the day. With the weak (top) bars about to yield
+    it refused true small load steps, and the rescue then took a far state along the yield
+    plateau (curvature 3.5 -> 11.7 rad/km), past the peak near 4 rad/km. The filter is now off
+    by default (SR_STAGNANT=1 turns it on): the driven fallbacks do what it was for. Sweep
+    after: 277.6, 284.7, 287.4 at -0.12, -0.10, -0.08 m. All four sections and
+    --check-mechanics are the same or better (1.84 -> 1.78 %; circle's sides 1.07 -> 0.26 %).
+  - Tried and dropped: holding the axial force and the moment to a tenth or a quarter of their
+    band (SR_NM_TOL). Their band is sized from the section, so next to pure shear it is large
+    beside the loads (sample beam, M/V 0.11 m: 4 tolerances are 1.7 kNm on 30 kNm, and a state
+    was accepted at 280.3 kN where the path carries 275). Tighter, the overshoot shrank (276.4)
+    but more runs ended in solver stops (column, both orientations: largest difference 1.9 ->
+    5.1 %). Left at 1; the looseness is real and still open.
+  - Prestressed T-beam: not real. For M/V -0.075 to -0.015 m the path solver stops at about
+    250 kN, at the diagonal cracking of the web (largest shear strain under 1 mm/m), against
+    379 kN in pure shear and 396 at -0.09 m; +0.03 m (40 layers, 295 kN) and +0.075 m (80
+    layers, 324 kN) drop out the same way. In the diagrams these stalls go to the older
+    load-stepping solver and to re-meshing (the sweep calls the path solver alone), which is
+    where the T-beam's dents and its unconfirmed point come from. Open: the same item as "T-beam
+    pure shear ... the prestressed flange cracking and the shares cycling" above.
+  Full diagrams now (20 points a side; start of the day in brackets): sample beam 11.1 s
+  (11.2), dents summed 6.6 % (16.0); column 6.6 s (10.7), sides within 0.41 % (2.25), largest
+  dent 0.88 % (2.36); circle 5.6 s (48.3), sides within 0.26 % (2.37); T-beam 12.6 s (34.3),
+  largest dent 3.45 % (3.41), 1 unconfirmed (4). Total 35.9 s (104.5). --check-mechanics 1.78 %
+  (1.95), 20/20.
+* Steps near the largest shear, and continuation between ratios (2026-11-26). A 600 x 750 column
+  (f'c 40, 9 x 25M top and bottom, three pairs of side bars, 20M ties @ 300; now
+  shots/cases/col750.rsp, in the benchmark) gave a ragged top with 40 points a side: 1258,
+  1221, 1255, 1214, 1234, 1249, 1283 kN between 210 and 510 kNm. `--bench-sweep` on one mesh:
+  smooth and mesh-independent from M/V 0.50 m up (40 and 80 layers within 0.5 %), but below it
+  in steps - 1251-1256 kN up to 0.24 m, 1226 falling to 1209 at 0.26-0.34 m, 1266 at 0.36 m,
+  1317 at 0.50 m - and the 80-layer mesh steps at other ratios (down to 1225 already at 0.10 m).
+  Traced (0.24 against 0.26 m): the two runs are the same up to 1210 kN; then at 0.24 m a whole
+  zone of web layers between two bar layers crosses to the yielded-stirrup branch at once (total
+  web shear strain +70 %) and the run goes on to 1258, while at 0.26 m only a few layers cross
+  and it stalls at 1226. The state the one run found must exist for its neighbour too.
+  - Continuation between ratios (`path::shear_path_seeded`, `analysis::continue_between_ratios`):
+    every run keeps the state of its largest load on the diagram's mesh; a point that falls more
+    than 0.4 % short of the chord between its neighbours is restarted from each neighbour's
+    state, re-balanced for its own M/V at that load (or 1, 2.5, 5 % under it), and carried on
+    with the usual load levels and fallbacks; the higher result is kept. Passes are repeated
+    until nothing changes (a low stretch recovers one point a pass from its ends), each pass's
+    restarts side by side. SR_NO_CONTINUE=1 turns it off; SR_INTER=1 lists each restart. Column,
+    40 points: 1264, 1257, 1260, 1258, 1257, 1255, 1254, 1257, 1274, 1294, 1324, 1310, 1291 kN
+    from 0 to 755 kNm; largest dent 2.85 -> 1.26 %, dents summed 21.9 -> 9.2 %, sides within 2.48
+    -> 1.60 % (mean 0.14 -> 0.08 %), 7.9 -> 8.7 s. Restarted points whose run ends without
+    proof of failure are marked unconfirmed (5 of 83).
+    It also raises points in the bending-dominated part by 1-4 % (M/V 1.3-2.2 m: 755 -> 788 kN
+    at 1.97 m): those runs end at the 25 mm/m shear-strain limit with the load still rising, so
+    the load reached depends on the path taken to the limit, and the restarted path reaches it
+    later. Balanced states, kept; the limit itself is the open question there.
+  - Tried and dropped: a stirrup-crossed layer at its limit not ending the run unless the web
+    as a whole has under 2 % left (SR_WEB_RESERVE=1). No capacity changed - shear-strain control
+    from such a state only falls - but the runs lost their proof and went to re-meshing (4.5 ->
+    9.6 s).
+  - Prestressed T-beam, stalls at web cracking: the cracking rescue balances the section, then
+    updates the shear shares and solves again; a pass that failed after others had balanced
+    threw the whole step away. Going back to the last good pass with half the update
+    (SR_SHARE_BACKOFF=rescue, or =all for every solve) recovers three of the six stalled ratios
+    of the sweep (M/V -0.075 m 246 -> 398 kN, -0.03 m 254 -> 393, +0.03 m 296 -> 403); the other
+    three still stall (shares moving 20-35 % of the shear from pass to pass when the prestressed
+    flange cracks). Off by default: on the five benchmark diagrams "rescue" leaves the T-beam
+    with 3 unconfirmed points and 1.7 x its time, "all" gives the 600 x 600 column 4 unconfirmed
+    points. In the diagram the stalled ratios are recovered by the continuation instead (T-beam:
+    unconfirmed 1 -> 0, inside 2 -> 0, largest dent 3.45 -> 2.28 %; 344 to 423 kN without a
+    drop from -87 kNm to 0). A single run at one of those ratios still falls back to the older
+    load-stepping solver.
+  Five sections, 20 points a side (timings on a loaded machine, +-30 % from run to run):
+  | section | time s | asym max | dent max | unconfirmed |
+  |---|---|---|---|---|
+  | sample beam | 14.2 | - | 3.03 % | 0 |
+  | column 600 | 8.0 | 0.41 % | 0.88 % | 0 |
+  | column 750 | 6.8 | 1.10 % | 2.91 % (the flat top meeting the rise; 1.26 % at 40 points) | 0 |
+  | circle 16 bars | 8.4 | 0.26 % | 3.29 % (real shape) | 0 |
+  | T-beam | 13.9 | - | 2.28 % | 0 |
+  --check-mechanics 1.78 %, 20/20 (unchanged by the continuation, which acts on diagrams only).
+  Still open: the steps are still there in single runs on one mesh (the continuation mends the
+  diagram, not the run); T-beam at 40 points a side takes 36 s with 11 unconfirmed points and
+  dents of 4.7 and 4.9 % at -164 and +130 kNm.
+* Single runs that stall at web cracking (2026-11-26). Prestressed T-beam (quick-tee.rsp),
+  `--bench-sweep` on 40 layers: M/V -0.075, -0.06, -0.045, -0.03, -0.015 and +0.03 m stopped at
+  246-296 kN with the web's largest shear strain under 1 mm/m, against 379 kN in pure shear and
+  396 at -0.09 m (80 layers: -0.06, -0.03 m, and 238 kN at -0.24 m). How the runs that got
+  through did it (pure shear traced): load control stalls at 274 kN and 1.3 mm/m; the next
+  balanced states are those of a web cracked right through with its stirrups working, 367 kN
+  at 4.1 mm/m, and they were reached only when one of the six step-over sizes of the driven
+  fallback happened to land there from the scaled-up last step. No fallback order changes this
+  (drop first, one drive, no shear drive, halving first: all tried).
+  - Cracking step-over: at a stall with the web under 2 mm/m, the driven step is also tried from
+    the guesses made for a cracking web (`jump_guess` families 6, 4, 5: the whole web crossed by
+    stirrups, or the fastest layers, each layer's stirrup strain following its shear strain; x
+    1.5, 2.5, 4, 7), with the shear shares of the guessed state, the step taken as far as the
+    guess goes, and the share iteration backing off to its last good pass when a pass fails
+    (SR_NO_CRACK_HOP=1). Recovers -0.06, -0.015, +0.03 m on 40 layers (386, 387, 379 kN) and
+    -0.03 m on 80.
+  - Past cracking by a neighbouring ratio (`path::past_cracking_by_neighbour`, in `shear_path`):
+    a run of a section with stirrups whose stop was governed by the web and whose web is under
+    2 mm/m at its largest load is not taken as failed. Ratios 15, 30, 60 and 100 mm to either
+    side are run until one gets past cracking; its peak state is carried back to the ratio
+    asked for (`shear_path_seeded`) and the run goes on from there. The states are joined to
+    the run and the reason says where it came from ("[web cracking passed from M/V 0.090 m]").
+    SR_NO_CRACK_NEIGHBOUR=1 turns it off. Recovers the rest: -0.075, -0.045, -0.03 m on 40
+    layers (400, 394, 400 kN), -0.06 and -0.24 m on 80 (399, 348 kN). No ratio of the sweep is
+    under 330 kN on either mesh now.
+    Limited to web-governed stops: without that it also fired on bending-dominated runs (their
+    webs stay under 2 mm/m too) and the helper runs doubled the time of the sample beam's and
+    the circle's diagrams (18-24 -> 42-45 s for the pair).
+  After: sweep, 40 layers, -0.105 to +0.06 m: 391, 396, 400, 386, 394, 400, 387, 391, 411, 379,
+  419, 414 kN - no stalls, but still a scatter of a few per cent from ratio to ratio (where the
+  step over cracking lands). T-beam diagram, 20 points a side: 305, 327, 344, 363, 372, 379,
+  394, 407, 419 kN from -115 kNm to 0 without a drop; 0 unconfirmed, largest dent 3.58 % at
+  +44 kNm (416 kN between 419 at 0 and 445 at 93: the level top meeting a step, as on the
+  columns), 13.9 -> 10.1 s. The other four benchmark sections: results unchanged. --check-
+  mechanics 1.78 %, 20/20 (unchanged).
+* The cause of the steps: the rule for the shear shares; and the original as a reference only
+  (2026-11-26). Owner's direction: after this many changes, agreement with the original is to be
+  reported, not used to accept or reject a method - the original may have faults this rebuild
+  does not. Solver changes are judged on stability (both moment signs, mesh to mesh, ratio to
+  ratio), mechanical soundness and speed.
+  Found while chasing the scatter between neighbouring ratios (T-beam: 421-425 kN across a whole
+  range of ratios, 437-449 on others, each ending with the same upper web layer at its stress
+  limit but carrying a different share of the shear). The shares came from one of two rules:
+  the difference of two fully solved sections at curvatures +-2 % (in effect the tangent, with
+  every layer's two-dimensional state in it) until a reinforcing bar reached 0.98 ey, the
+  secant dual section after (`SR_FLOW_SECANT` default "hybrid"). Forcing one rule throughout,
+  600 x 750 column, one mesh, M/V 0 to 0.56 m:
+    hybrid / difference: 1251 1250 1254 1254 1251 1256 1256 1221 1214 1266 1283 1268 1288 1309 1296
+    secant throughout:   1280 1280 1280 1280 1280 1280 1280 1286 1291 1304 1325 1330 1326 1310 1295
+  The difference rule is what made the steps: it depends on which branch every web layer is on,
+  so the shares - and the load at which the weakest layer reaches its limit - jump from ratio to
+  ratio. Widening its interval (SR_FLOW_H 0.15, 0.4, 0.8) does not smooth it.
+  - New default, `path::smooth_tangent_changes` (SR_FLOW_SECANT=tangent): stiffnesses from the
+    strain plane alone, as the secant rule, but with the slope of the curve where a material
+    bends before any yield - concrete in compression (slope of its uniaxial curve) and
+    prestressing strand (slope of its own curve); reinforcing bars stress over strain (their
+    modulus before yield, and still some stiffness on the plateau); concrete in tension stress
+    over strain. Same step-free column curve as the secant rule (the column's bars and concrete
+    are in the range where the two agree). SR_FLOW_SECANT=hybrid / secant / off give the others.
+  - Curvature control drives the curvature in the sense of the growing moment, not of the
+    curvature the section has (a prestressed section is still cambered the other way when its
+    web cracks; driving the camber unloaded it: T-beam M/V 0.135-0.165 m "peaks" of 398-414 kN).
+    SR_CURV_OWN_SIGN=1: the earlier rule.
+  - A driven step that loses more than 2 % of the load at once is taken again at half the size
+    (SR_NO_DROP_CHECK=1); a run that stepped over web cracking also tries the branch of the
+    ratios 15 mm to either side (`branch_of_neighbours`, SR_NO_BRANCH_NEIGHBOUR=1); the
+    web-cracking tests use "no stirrup at yield and under 5 mm/m" instead of "under 2 mm/m"; the
+    neighbour step also serves a run that ends in a solver stop with its web under 5 mm/m.
+  - The continuation between ratios in the diagram is off by default now (SR_CONTINUE=1): with
+    the steps gone at the source it only lifted bending-dominated points on one side (600 x 600
+    column: sides within 0.32 % without it, 2.35 % with; sample beam 0 unconfirmed without, 3
+    with).
+  Measured. One mesh, both orientations, 29 ratios (largest / mean difference): column 600
+  0.05 / 0.00 %, column 750 0.39 / 0.03 %, circle 0.07 / 0.00 % (this morning the column 600
+  was 5.54 / 0.31 %). Column 750 sweep, 40 against 80 layers: 1280 / 1283 at M/V 0, 1330 / 1330
+  at the peak, within 0.5 % at every ratio. T-beam sweep, -0.48 to +0.15 m: 272 rising to 441
+  kN without a break, the two meshes within 1 %.
+  Diagrams, 20 points a side (start of the day -> now):
+  | section | time s | asym max | dent max | unconfirmed |
+  |---|---|---|---|---|
+  | sample beam | 11.2 -> 10-17 (noisy) | - | 3.99 -> 3.07 % (the real slope at M = 0) | 0 -> 0 |
+  | column 600 | 10.7 -> 7.0 | 2.25 -> 0.32 % | 2.36 -> 0.83 % | 0 -> 0 |
+  | column 750 | (new) 3.5 | 0.13 % | 0.79 % | 0 |
+  | circle 16 bars | 48.3 -> 3.5 | 2.37 -> 0.04 % | 4.17 -> 2.63 % (real shape, same both sides) | 2 -> 0 |
+  | T-beam | 34.3 -> 9.4 | - | 3.41 -> 0.88 % | 4 -> 1 |
+  Column 750 at 40 points a side: 1280, 1279, 1280, 1280, 1281, 1283, 1293, 1322, 1330, 1313,
+  1291, 1263, 1233 kN from 0 to 867 kNm; sides within 0.17 %; 5.9 s.
+  Against the original (reported, not a test): mean difference 1.78 -> 2.27 %, 20/20 within
+  tolerance. What moved: shear capacity at N = -6000 kN +0.15 -> +7.72 % (832 against 772.6 kN:
+  under heavy compression the difference rule matched the original; the smooth rules do not -
+  secant gives -6.8 %); prestressed T-beam M/V 1.5 m -7.0 -> -8.3 %; M/V 4 m +1.3 -> -1.5 %;
+  strands only M/V 1.5 m -0.2 -> -0.8 %. Whether 772.6 or 832 is nearer the truth for that
+  column is not known; it is the one large change and worth an independent check.
+  Still open: T-beam M/V +0.165 to +0.33 m, 414-438 kN beside 441-449 (40 points a side:
+  dents of 3.9 and 3.1 % at 94 and 177 kNm); the web-reserve question (one stirrup-crossed
+  layer at its limit ends a run).
+* Independent check of the heavy-compression case, and the rule that came out of it (2026-11-26).
+  The smooth tangent rule had moved "shear capacity at N = -6000 kN" (sample beam, 300 x 600,
+  f'c 40, 33 MPa of axial stress) from 773.8 to 832 kN against the original's 772.6.
+  - `--check-shares file N V [layers]` (SR_CHECK_M: at a moment): an equilibrium check. The
+    shear stress at a depth is the rate at which the longitudinal force below it changes along
+    the member; two neighbouring sections are solved in full (same N and V, the moment a
+    little apart) and the difference of their longitudinal stresses gives the shear stresses
+    equilibrium asks for, set beside those the run was solved with. (It fails where the two
+    states differ by a branch jump - the circle at M/V 0.14 m - and then prints a flat profile.)
+  - Result at N = -6000 kN: up to 720 kN every rule is within 1.5 % of V. Beyond, the smooth
+    tangent rule placed 5.39 MPa uniformly over the web at 800 kN where equilibrium gives a
+    peaked profile with 6.38 MPa at mid-depth (13 % of the shear misplaced, the largest stress
+    16 % low): the concrete is past the peak of its curve (-2.1 to -2.9 mm/m), its slope is
+    zero or negative and was clamped to zero, so no layer had any stiffness and the shear was
+    spread evenly. The difference rule at 780 kN is within 1.5 % of V. So about 740-785 kN is
+    what agrees with equilibrium and 832 was an artefact of the rule; the original's 772.6 is
+    sound here.
+    Hand values for scale only (design formulas are not made for 0.83 f'c of axial stress):
+    CSA A23.3 general method 824 kN (beta 0.571 and theta 27.6 deg at ex = -0.2 mm/m), ACI
+    318-14 762 kN, ACI 318-19 603 kN.
+  - Tried: a floor on the slope of a quarter or a half of the uniaxial secant - too peaked,
+    727 kN (the web's own softening under shear is not in a uniaxial stiffness). A rule from
+    every layer's solved state (`path::state_changes`, SR_FLOW_SECANT=state: longitudinal stress
+    over strain from the two-dimensional state, times the slope-to-secant ratio of the uniaxial
+    curve): 768 kN and within 1.0 % of equilibrium up to 740 kN, the T-beam smooth over its
+    whole range (269 -> 475 -> 453 kN, 40 and 80 layers within 1 %), the 750 column step-free;
+    but on the circle it moves shear into the cover outside the hoop and the runs at M/V
+    0.14-0.18 m end there at 350-374 kN (396 and 422 either side, 30 s for the diagram), and
+    its values at N = -6000 kN scatter with the mesh (824 / 768 / 768 / 742 on 30 / 40 / 60 /
+    80 layers). Kept as an option.
+  - Adopted: the smooth tangent rule with a floor from the layer's own state - a compressed
+    concrete layer's stiffness is the slope of its uniaxial curve but never under a quarter of
+    its solved state's stress over strain (SR_TAN_FLOOR; 0 = the slope alone). Away from the
+    peak nothing changes; near and past it the state value takes over. N = -6000 kN: 760 / 763
+    / 769 / 768 kN on 30 / 40 / 60 / 80 layers (the other rules scatter by +-5 %: difference
+    739 / 784 / 739 / 776, slope alone 804 / 832 / 821 / 853).
+  Now, 20 points a side: sample beam 0 unconfirmed; column 600 sides within 0.32 %, largest
+  dent 0.83 %; column 750 0.13 %, 0.79 %, 2.7 s; circle 0.10 %, 3.1 s; T-beam 0 unconfirmed,
+  largest dent 1.39 %, 9.6 s; total 36.1 s. One mesh, both orientations: column 600 within
+  0.05 %, circle 0.07 %, column 750 0.46 %. Against the original (reported only): 1.91 %,
+  20/20; N = -6000 kN +0.50 %.
+* Dents in the Vx-Vy shear diagram (2026-11-26). A 450 x 750 column (f'c 45, 8 x 20M top, 7 +
+  1 x 25M bottom, closed 20M ties, 600 mm2 @ 150; Beam1.rsp), N = 0, shear only, 24 directions:
+  1529, 1517, 1404, 1274, 1065, 1102, 971 kN at 0, 15, ... 90 degrees - dents at 60 and 90.
+  Both halves of the diagram, solved separately, gave the same numbers: not run-to-run noise.
+  Three causes, in the turned section and in the solver's scaling:
+  - Tie area by layer. Each layer of the turned section took the tie sides crossing its own
+    height. A 350 x 650 tie turned towards 61.7 degrees (atan of its sides) has a band at
+    mid-depth where a cut meets its two long sides, steeply inclined - 22 mm high at 60 degrees,
+    300 mm2 against 410 either side - and the shear stress being largest there, that one layer
+    set the capacity (1065 kN at 60, 1100 at 65). The area is now averaged over a window of
+    one tie spacing (at most a quarter of the depth) inside the tie's height: ties are bars one
+    spacing apart and a diagonal crack meets them over about that height. SR_TIE_POINT=1: the
+    layer's own height. 60 degrees: 1065 -> 1156 kN.
+  - Slivers and the 25 mm/m limit. On finer meshes the runs ended far too early (80 layers: 554
+    kN at 35 degrees, 617 at 45, where 40 layers gave 1359 and 1274): one layer at the tip of
+    the turned section "reached" a shear strain of 95 000 and the run was ended as "very large
+    shear strain". A layer of a few square centimetres is held to the same force tolerance as
+    a full one (about 1 MPa for it), so its strain is not determined. Layers under a quarter
+    of the average layer area no longer count towards the largest shear strain
+    (SR_ALL_LAYERS_GMAX=1).
+  - The shear scale. Load steps and tolerances were fractions of 0.25 sqrt(f'c) x the
+    narrowest layer's width x 0.8 h; for a tapering section that is the tip, and it shrinks as
+    the mesh is refined: on 80 layers the run at 45 degrees climbed 1.4 kN a step and ran out
+    of its 600 steps at 851 kN. Now the median layer width (`path::scale_width`): unchanged for
+    a rectangle, the web for a T- or I-beam. SR_SCALE_MIN_WIDTH=1: the narrowest.
+  Every direction is now solved on its own; the half from 180 to 360 degrees used to be copied
+  from its mirror image (SR_V2D_MIRROR=1). SR_V2D_ONLY=theta runs one direction for tracing.
+  After, the column, every 5 degrees from 0 to 90, one mesh:
+    40 layers: 1529 1531 1518 1502 1470 1458 1393 1362 1330 1275 1219 1193 1166 1140 1155 1093 1030 983 971
+    60 layers: 1526 1524 1515 1498 1476 1428 1398 1354 1329 1289 1227 1182 1166 1140 1144 1108 1036 981 962
+    80 layers: 1529 1524 1507 1495 1467 1431 1401 1369 1335 1281 1228 1189 1156 1148 1142 1096 1035 981 961
+  (before, 80 layers: 1529 1530 1513 1502 1356 1425 1398 554 1329 617 654 624 794 810 844 930
+  1031 969 961). 24 directions, each on its own: mirror pairs within 0.2 % (1092.7 / 1092.8 at
+  75 / 285 degrees), 1.6 s; 72 directions 2-5 s (5.6 s for half of them before). One bump of
+  1.3 % is left at 70 degrees on 40 layers (1155 after 1140), not on 80.
+  M-V diagrams: the rectangles and the T-beam unchanged; the circle's largest dent 2.63 -> 1.00
+  %, its sides within 0.38 %. --check-mechanics 1.91 %, 20/20 (unchanged).
+* The bulge of the Vx-Vy diagram next to the weak axis, checked (2026-11-26; 450 x 750 column,
+  Beam1.rsp / shots/cases/col450x750.rsp, 34 directions). At 74.1 degrees the model gives 1101.5
+  kN (Vx 1059.5, Vy 301.4) but at 84.7 degrees 984.7 kN: a sideways component larger than the
+  sideways capacity alone, and a concave contour.
+  - Elastic check by principal axes (rectangle 450 x 750, per unit shear, at the cut through the
+    centroid perpendicular to the shear; MPa per MN):
+      theta   cut mm   turned-section average   free two-axis bending average   peak resultant
+        0      450           4.444                     4.444                        4.444
+       15      466           4.370                     4.309                        4.444
+       30      520           4.127                     3.941                        4.444
+       45      636           3.660                     3.436                        4.444
+       60      866           3.020                     3.045                        4.444
+       75      776           3.952                     4.070                        4.444
+       90      750           4.444                     4.444                        4.444
+    "Turned-section average" is what a layered model of the turned section works with: the
+    stress along the shear, averaged over the whole cut. At 75 degrees it is 11 % under the
+    on-axis value (capacity x 1.125 if that stress governs) - the model's 1101.5 / 984.7 = 1.12.
+    The two principal components superposed give a peak at the centre of 1.5 V / A at every
+    angle: the largest stress does not fall off the axis at all. The bulge is the averaging
+    across the width (the corners of the turned section, lightly stressed, are counted with the
+    middle), not a gain of strength; the bending constraint of the turned section (no sideways
+    curvature) is the smaller part of it (3.952 against 4.070).
+  - Against interaction rules on the model's own two axis capacities (1529.3 and 984.55 kN):
+      theta    model   ellipse   ACI 318-19 trilinear   model/ACI   Vx / Vn,90
+      10.6    1515.5   1494.0        1555.9               -2.6 %       0.283
+      21.2    1466.2   1405.0        1535.4               -4.5 %       0.539
+      31.8    1391.9   1296.1        1374.9               +1.2 %       0.745
+      42.4    1311.5   1193.3        1284.5               +2.1 %       0.898
+      52.9    1195.6   1109.9        1234.4               -3.1 %       0.969
+      63.5    1131.8   1047.5        1100.1               +2.9 %       1.029
+      74.1    1101.5   1006.9        1023.7               +7.6 %       1.076
+      84.7     984.7    987.0         988.8               -0.4 %       0.996
+    The model is squarer than the ellipse (up to +10 %) and within 3 % of the ACI trilinear rule
+    (either ratio alone when the other is at most 0.5, otherwise the sum at most 1.5) everywhere
+    except 60-80 degrees, where its sideways component passes the sideways capacity (by 7.6 % at
+    74.1 degrees).
+  - Outside evidence, from abstracts only: Massone and Correa (Engineering Structures 2020)
+    report that taking the resultant shear and a one-way strength along it is unconservative
+    when shear acts about both axes, and that the ACI 318-19 trilinear curve fits test data; an
+    AIJ study reports an elliptical shear failure surface. Tests are few.
+  Conclusion: the bulge between about 60 and 80 degrees (and its mirrors) is not supported;
+  the rest of the model's shape is. Not changed yet - how to limit it is the owner's choice
+  (the least assumption: no component may exceed the capacity along its own axis).
+* The limit on the Vx-Vy diagram (2026-11-26, `shear2d::diagram`). After every direction has
+  been analysed, each is held so that neither component exceeds the capacity along its own
+  axis: |Vx| <= Vn at 90 (or 270) degrees, |Vy| <= Vn at 0 (or 180). The four axis capacities
+  are solved for directly when they are not among the directions (34 directions have no run at
+  90 degrees). A held direction keeps what the analysis gave in `VRun::v_model` and says which
+  axis holds it in `VRun::limited`; the table shows "sideways capacity (analysis 1101.5)", the
+  plot draws the point hollow, the MCP tool returns `limited_by_axis_capacity` and
+  `v_analysis_kn`. SR_V2D_NO_CAP=1 turns it off.
+  450 x 750 column, 34 directions: 63.5 degrees 1131.8 -> 1084.4 kN, 74.1 degrees 1101.5 ->
+  1009.2, 84.7 degrees 984.7 -> 974.8 (the sideways capacity itself is 970.7 kN at 90 degrees),
+  and their mirrors; nothing else changes. 24 directions, 0 to 90: 1529.3, 1501.8, 1392.7,
+  1274.9, 1120.9, 1004.9, 970.7. 600 x 600 column: no direction held (751 kN on the axes, 692
+  on the diagonals).
+* The N-V diagram: the hang, and its roughness under heavy compression (2026-11-26).
+  - The hang. The diagram ran the older load-stepping solver (`shear_response_steps`) at every
+    axial level beside the strain-driven one and kept the larger peak. That solver took 2-9 s a
+    level in compression and did not return under tension (450 x 750 column, N = +1500 kN: over
+    25 s; its loops are bounded but nested several deep and each state solve is slow there), so
+    the app stayed on "N-V interaction". The strain-driven runs take 0.2-0.6 s each. The check
+    is no longer run (SR_NV_OLD_CHECK=1 runs it), and the older solver has a time allowance
+    wherever it is still a fallback (SR_OLD_BUDGET seconds, default 4: it then ends where it is,
+    unconfirmed, "ran out of its time allowance"). N-V, 20 points: 450 x 750 column 3.3 s, 600 x
+    750 2.5 s, 600 x 600 2.9 s, sample beam 6.3 s, circle 3.9 s, T-beam 7.2 s.
+  - One layer running away. Under heavy compression a run would take a state in which one
+    layer's shear strain jumped (2.2 to 12.4 mm/m) with the rest of the web still, and peak
+    low. Such a state is refused at any step size now (the largest shear strain more than
+    doubled, by over 2 mm/m, with the web's strains as a whole up by under half), in load
+    steps and in the rescue's candidates (SR_ALLOW_ONE_LAYER=1).
+  - Tie ratio by coverage. A layer has the tie ratio in proportion to the part of its
+    thickness inside the tie, not all or nothing by its centre (`analysis::build`,
+    SR_TIE_BY_CENTRE=1): the tied depth no longer changes by a whole layer from mesh to mesh.
+    600 x 750 column, N-V on 40 / 60 / 80 layers at N = -11 681 kN: 1967 / 1867 / 1879 kN before,
+    1875 / 1867 / 1879 after; at -14 208: 1990 / 1989 / 1964 -> 1974 / 1966 / 1978.
+  - Shear-strain control goes on through the drop after cracking: the 15 %-below-the-top rule
+    waits until the web has had the chance to work (a stirrup at yield or 5 mm/m, and then
+    12 mm/m of shear strain unless half the load is lost). SR_PEAK_WHILE_IDLE=1: the rule as
+    it was. It changed no result on this column; kept as the consistent reading of a cracking
+    drop.
+  After. 600 x 750 column, 25 levels: from N = -10 400 kN to the tension end the three meshes are
+  within 0.5 % and the curve is smooth (1792, 1737, 1669, 1594, 1514, 1432, 1364, 1353, 1293,
+  1242, 1198, 1026, 600, 264, 0 kN). 450 x 750 column, 12 points: 0, 2550, 2629, 2645, 2679, 2681,
+  2659, 2620, 2534, 2433, 2354, 2285, 2180, 2131, 2064, 1982, 1923, 1945, 1870, 1793, 1643, 1397,
+  1074, 661, 0 kN from -17 091 to +2919 kN (one bump of 1.7 % at -2918 kN).
+  Still open, heavy compression only (beyond about 60 % of the squash load): the 600 x 750 column
+  has two families, about 1940-1990 kN up to N = -14 400 kN and about 2150-2280 kN from -14 600
+  kN (a step of 10 %; 40 layers up to 5 % above 60 and 80 between -16 700 and -18 000 kN). There
+  the whole section is at the concrete's peak strain, the cover at f'c, the web shedding axial
+  stress as it softens under shear; the lower family peaks as the web cracks and does not
+  recover along its own path. Also open: the labels at the ends (pure tension reads "web shear",
+  heavy compression "flexure").
+  M-V, two-direction shear and the symmetric checks after these changes: the same or slightly
+  better (sample beam's largest dent 3.08 -> 2.80 %, circle's 1.00 -> 0.61 %; one mesh, both
+  orientations: column 600 0.12 %, column 750 0.20 %, circle 0.07 %). --check-mechanics 1.97 %
+  (was 1.91), 20/20.
+* The N-V step under heavy compression: spurious and unstable branches (2026-11-26). 600 x 750
+  column: about 1940-1990 kN up to N = -14 400 kN, about 2150-2280 kN from -14 600 kN. The two
+  final states compared layer by layer:
+  - Split cover. In the higher family the two outermost layers (no ties, 0.16 MPa of shear) had
+    transverse strains of 113 and 134 mm/m and carried 1.7 MPa of axial stress instead of 38.
+    An untied layer has two balanced states under next to no shear - whole, or split wide open
+    and carrying nothing - and the rescue's guesses that scale every strain up reach the
+    second. A state with an untied layer over 25 mm/m across is refused wherever a state is
+    accepted (SR_ALLOW_SPLIT_COVER=1). -14 600 kN: 2174 -> 2105 kN.
+  - Unstable branch. Still higher than its neighbour: after a jump at 1996 kN to a state with
+    the whole web cracked, the load "rose" to 2105 kN as the web's shear strains shrank
+    (share-weighted, 0.162 to 0.140) - the falling side of a softening curve climbed backwards.
+    Load-controlled steps and the rescue's candidates are refused when the second-order work
+    against the most deformed state so far is clearly negative: dN d(ec) + dM d(phi) +
+    dV d(gamma), gamma the layers' shear strains weighted by their shares, under -1 % of the
+    load changes times the reference deformations (`path::work_negative`, SR_NO_WORK_CHECK=1).
+    Steps that prescribe a deformation are exempt. Sweep of N at 40 layers, -13 000 to -19 500
+    kN: before 1938 1973 2073 1990 1977 2174 2177 2144 2218 2101 2282 2258; after 1935 1946
+    1976 1982 1977 2005 2015 2055 2041 2092 2170 2226.
+  - The same check caught a bending run: sample beam, M/V 4 m, where at yield the rescue threw
+    the section from 5.3 to 70.7 rad/km, past the top of the moment-curvature curve, and the run
+    then climbed its falling side backwards to 86.1 kN at the 25 mm/m limit. Refusing those
+    steps alone left it at 81.9 kN (the plateau). So with a tension bar at 95 % of yield or more
+    in a run whose moment grows with the load, the rescues (`branch_guess` and the jump
+    candidates) are not tried and the run goes to curvature control (SR_JUMP_AT_YIELD=1): it
+    follows the plateau at 78 kN from 6 to 22 rad/km, rises with hardening to 88.2 kN at 56
+    rad/km and falls (original 87.4). A fall of 3 % below the top with the driven quantity
+    still growing counts as a passed peak, however the last steps went.
+  - `branch_of_neighbours` off by default (SR_BRANCH_NEIGHBOUR=1): with the smooth share rule
+    the T-beam sweeps are the same without it, and it lifted single bending-dominated ratios
+    by about 3 % (600 x 600 column, M/V 0.75 and 0.90 m).
+  After. N-V, 600 x 750 column, 25 levels, 40 / 60 / 80 layers: within 1.5 % at every level but
+  one (-17 999 kN: 2192 / 2140 / 2128), and smooth: 2115 2208 2234 2192 2102 2049 1974 1921 1875
+  1793 ... on 40 layers. N-V times, 20 points: 2.8-5.8 s on six sections.
+  M-V, 20 points a side: sample beam 3.9 s (19.2 before this entry), column 600 1.7 s (7.4),
+  column 750 3.2 s, circle 2.8 s, T-beam 4.5 s (9.1); total 16.0 s (44.7; 104.5 at the start of
+  the day for four of them). Not trying far jumps at yield is most of that: those attempts
+  were slow, and the runs now end with proof and are not re-meshed. Largest dents: column 600
+  0.75 %, column 750 0.79 %, circle 0.95 %, T-beam 2.34 %, sample beam 2.79 % (the slope at
+  M = 0). One mesh, both orientations: column 750 0.29 %, column 600 0.25 %, circle 0.02 %, with
+  10-13 s of solver time for 58 runs (20-40 s before). Two-direction shear unchanged.
+  --check-mechanics 2.05 %, 20/20 (M/V 4 m -1.5 -> +0.9 %; moment only +1.5 -> +0.3 %; shear at
+  N = -6000 kN +0.5 -> -2.3 %; strands only M/V 1.5 m -0.8 -> -1.4 %).
+* Failure labels along the N-V diagram (2026-11-27). Pure compression and the levels next to it
+  read "Flexure (bending capacity)", with "Web crushing" in between from one level to the next
+  (600 x 750 column, 12 points: Flexure at N = -23 053, -21 789, -20 526, -16 735 and -15 472 kN,
+  web crushing at -19 262 and -17 999). No moment acts in those runs. The label rested on the
+  work done from just before the peak, shear against "bending" - and bending included the axial
+  load times the change of the centroid strain, which under heavy compression is large and
+  depends on how far past the peak the run went (shear / axial work at five neighbouring levels:
+  863 / 4754, 472 / 2270, 2962 / 189, 1570 / 6905, 6665 / 4362 N).
+  - A sixth label, "Concrete crushing (axial compression)" (`Mechanism::Crushing`, purple in the
+    plots). Where the axial load does more work than the moment (`axial_c`): with a layer at
+    its compressive limit the concrete crushed, as a diagonal strut (web crushing) if the
+    compression where the shear is carried - the layers' angles weighted by their shear forces,
+    at the peak load - lies 10 to 80 deg from the member axis, as axial crushing under 10 deg.
+    The mean angle of the layers at their limit was tried first and jumped with which layers
+    those were (column 750: 8.8, 10.5, 7.3, 11.8 deg at four neighbouring levels).
+    SR_NO_AXIAL_LABEL=1 restores the old rule. Under tension the strands count as yielded at
+    95 % of fy, and a run with no bar at yield is "Unclear", not "Flexure".
+  - The M-N diagram's pure-compression end carries the new label too (it read "Web crushing").
+  - One changeover along the curve (`single_crushing_changeover`, SR_NV_RAW_LABELS=1 for each
+    run's own label): near it the angle turns slowly (sample beam: 9.7, 10.0, 10.4, 10.3, 9.6,
+    11.1, 8.7, 10.4 deg over eight levels) and the two crushing labels alternated five times;
+    the changeover is put where it disagrees with the fewest runs.
+  - The solver's own test of whether the web governed a stop (`past_cracking_by_neighbour`)
+    keeps the work comparison (`ShearResult::web_work`), so no number changes: the N-V and M-V
+    points of five sections are the same to the last digit, and --bench-mv 20 gives the same
+    dents, asymmetries and peaks (17.8 s on a busy machine, 16.0 before).
+  - Web shear against web crushing: tried reading the struts at the peak load and where the
+    load first drops under 99.5 % of it, in place of the end of the run. Neither is steadier:
+    the ties yield first, the load stays nearly level from a tie strain of 2 to 10 mm/m, and
+    the struts reach their limit within the next 3 % of load (struts at 0.44-1.00 of their
+    limit at the peak, 0.46-1.00 at the drop, 0.92-1.00 at the end, on the columns). The end of
+    the run is kept (SR_CRUSH_AT=peak or drop for the others). Still open: the circle between
+    N = -4900 and -1700 kN alternates between the two (its runs end with struts at 0.68-1.00),
+    as before. On these sections the two labels describe one failure - ties yielded, then the
+    web crushed.
+  After, 40 levels: column 750 axial crushing to -21 537 kN, web crushing -20 779 to 3482, bars
+  yielded / hardening from 4240 kN to pure tension (7272); column 600 axial crushing to
+  -12 576 kN (the top of its curve, 1470 kN), web crushing to 447; sample beam axial crushing
+  to -6633; T-beam to -8393; prestressed T-beam to -5718; circle to -5233. Pure tension:
+  "Longitudinal bars strain-hardening" on all seven sections.
+* Web crushing means the struts crush before any tie yields (2026-11-27, the user's choice).
+  The first state of the run with an inclined strut at 85 % of its limit against the first
+  state with a tie at 98 % of yield: struts first (or no tie ever at yield) is web crushing,
+  ties first is web shear - the capacity is the ties', and the struts crushing as the web goes
+  on deforming ends the level stretch without having set its height. Read over the whole run,
+  so it does not depend on which state is taken for the peak or on how far the run went.
+  SR_CRUSH_BY_END=1 restores the reading of the struts at the end of the run. Under compression
+  with the compression under 10 deg from the axis the label stays axial crushing; the one
+  changeover along the N-V curve (`single_crushing_changeover`) now has web shear on the web
+  side as well.
+  - Check on a web with more ties than its concrete can use: the T-beam with its ties at 250,
+    40, 20 and 10 mm, pure shear: 426, 984, 1156, 1278 kN. At 250 and 40 mm a tie yields before
+    a strut is at its limit (states 28 against 40, 55 against 62): web shear. At 20 and 10 mm
+    no tie ever yields (1.45 and 0.88 mm/m at the end) and the struts crush: web crushing, and
+    the capacity hardly grows with more ties.
+  - N-V, 40 levels, from compression to tension, no label alternating on any of seven
+    sections: column 600 axial crushing x5, web crushing x5 (-12 169 to -10 541 kN), web shear
+    x28, bars x3; column 750 x3, x7 (-20 779 to -16 230), x26, x5; column 450 x 750 x1, x13,
+    x24, x3; T-beam x2, x8, x29, x2; sample beam x5, x3, x31, x2; prestressed T-beam x7, none,
+    x32, x2; circle x13, none, x22, x6 (it alternated between web shear and web crushing eight
+    times). Under heavy compression the struts do crush first.
+  - M-V: the web-governed points of the five benchmark sections all read web shear. The
+    diagram adds a ratio wherever neighbouring labels differ, and they differ in fewer places:
+    column 600 47 -> 43 points, circle 56 -> 48, T-beam 47 -> 42, sample beam 44 -> 42; every
+    point kept is the same number as before (checked on the column and the circle against
+    SR_CRUSH_BY_END=1). The benchmark's figures move with the points: largest dent column 600
+    0.75 -> 1.21 %, circle 0.95 -> 1.72 %, T-beam 2.34 -> 2.81 %; circle's two orientations
+    0.78 -> 0.11 %; total 17.0 s. --check-mechanics 2.05 %, 20/20; unit tests pass.
+  - Still open: near the bending end of the M-V curve the column 600 reads web shear at
+    M = 476-485 kNm with V = 40-130 kN (bending capacity 483), and the circle has single web
+    shear / bars yielded points out of line with their neighbours. Both were there before.
+* "Web shear" next to the bending capacity (2026-11-27). Column 600, M-V: the three points
+  nearest pure bending (M = 476-485 kNm of 483, V = 40-130 kN) read web shear; column 450 x 750
+  the same with one web crushing. Two causes, both in the comparison of the shear's work with
+  the bending's:
+  - The window. It ran from the state before the peak to the end of the run: one solver step
+    before, and one step to hundreds after (circle, six neighbouring ratios: 1, 1, 4, 29, 370
+    and 3 steps). Next to the bending capacity one small step with a jump of shear strain on
+    the wide-cracked tension side outweighed the bending (M/V 12.3 m: shear 75 N, moment 60 N).
+    The label's comparison now starts where the load first reached 90 % of its peak - a window
+    set by the load, taking in the whole stretch over which the last tenth of the capacity was
+    reached (SR_WORK_LAST_STEPS=1 for the short one). The solver's own test of whether the web
+    governed a stop keeps the short window (`web_work`).
+  - Slivers. One edge layer of the circle with an undetermined shear strain made the "shear
+    work" of the run at M/V 1.14 m 5.8 MN, against 10.8 kN for the bending, and 15.6 kN in the
+    same run in the other orientation: web shear between bars-governed neighbours on one side
+    only. Layers under a quarter of the mean layer area are left out of the shear's work, as
+    they are out of the largest shear strain.
+  After, M-V, 20 points a side, from negative to positive bending, one block per label on all
+  seven sections: column 600 flexure, bars hardening x10, web shear x19, bars hardening x10,
+  flexure; column 750 x13, x17, x13; column 450 x 750 x10, x18, x11; circle bars yielded x8,
+  hardening x3, yielded x2, web shear x17 and the same back; T-beam, sample beam and
+  prestressed T-beam unchanged. No run's result changed (every point is one of the earlier
+  numbers, apart from the ratios the diagram now adds at the moved changeovers: 2 on column
+  750, 1 each on column 450 x 750 and the prestressed T-beam); N-V labels and numbers the same.
+  --bench-mv 20: 15.9 s, 0 unconfirmed, 0 inside; dents and asymmetries as in the entry above
+  (column 750 dent sum 3.94 -> 3.59 %, circle 7.04 -> 6.30 %). --check-mechanics 2.05 %, 20/20.

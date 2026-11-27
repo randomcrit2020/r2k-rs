@@ -248,9 +248,20 @@ pub fn build(sec: &Section, nlayers: usize) -> Result<SModel, String> {
             .map(steel_f)
             .ok_or("Stirrups need a steel type.")?;
         let (zb, zt) = (zmap(st.z_bot).min(zmap(st.z_top)), zmap(st.z_bot).max(zmap(st.z_top)));
+        // A layer has the tie ratio in proportion to how much of its thickness lies inside the
+        // tie. Counting a layer as tied when its centre does made the tied depth change by a whole
+        // layer from one mesh to the next - it matters most where the split between the tied web
+        // and the cover decides the answer, a column under very heavy compression (600 x 750
+        // under 15-18 000 kN: 40, 60 and 80 layers up to 5 % apart). SR_TIE_BY_CENTRE=1: as before.
+        let by_centre = std::env::var("SR_TIE_BY_CENTRE").is_ok();
         for ly in layers.iter_mut() {
-            if ly.z >= zb && ly.z <= zt && ly.b > 0.0 && st.spacing > 0.0 {
-                ly.rho_z = st.area / (ly.b * st.spacing);
+            if by_centre {
+                if ly.z >= zb && ly.z <= zt && ly.b > 0.0 && st.spacing > 0.0 {
+                    ly.rho_z = st.area / (ly.b * st.spacing);
+                }
+            } else if ly.b > 0.0 && st.spacing > 0.0 && ly.t > 0.0 {
+                let inside = ((ly.z + 0.5 * ly.t).min(zt) - (ly.z - 0.5 * ly.t).max(zb)).max(0.0) / ly.t;
+                ly.rho_z = inside * st.area / (ly.b * st.spacing);
             }
         }
         Some((steel, st.spacing.max(1.0)))
@@ -1150,6 +1161,9 @@ pub struct ShearResult {
     pub rescued: usize,
     /// what governed the peak, when the solver determined it
     pub mech: Option<Mechanism>,
+    /// the shear did more work than bending and axial load together from just before the peak
+    /// (the test the label used to rest on alone; the solver still goes by it)
+    pub web_work: Option<bool>,
 }
 
 /// What ended a run, in plain words.
@@ -1160,6 +1174,8 @@ pub enum Mechanism {
     LongHardening,
     WebShear,
     WebCrushing,
+    /// the concrete crushing under axial compression (compression within 10 deg of the member axis)
+    Crushing,
     Unclear,
 }
 
@@ -1171,6 +1187,7 @@ impl Mechanism {
             Mechanism::LongHardening => "Longitudinal bars strain-hardening",
             Mechanism::WebShear => "Web shear (crack slip / stirrups)",
             Mechanism::WebCrushing => "Web crushing",
+            Mechanism::Crushing => "Concrete crushing (axial compression)",
             Mechanism::Unclear => "Unclear (solver stop)",
         }
     }
@@ -1656,7 +1673,7 @@ pub fn new_or_old(m: &SModel, n_kn: f64, a: f64, mphi: &MPhiResult, old: impl Fn
 
 /// `step_scale` below 1 starts with smaller load steps (used to re-run a suspicious result).
 pub fn shear_response_steps(m: &SModel, n_kn: f64, mv: f64, mphi: &MPhiResult, step_scale: f64) -> ShearResult {
-    let mut res = ShearResult { mv, points: vec![], reason: String::new(), confirmed: false, rescued: 0, mech: None };
+    let mut res = ShearResult { mv, points: vec![], reason: String::new(), confirmed: false, rescued: 0, mech: None, web_work: None };
     if mphi.points.is_empty() {
         res.reason = "No moment-curvature result.".into();
         return res;
@@ -1679,7 +1696,18 @@ pub fn shear_response_steps(m: &SModel, n_kn: f64, mv: f64, mphi: &MPhiResult, s
     let unit = |st: &SectionState| -> Option<Vec<f64>> {
         (st.v > 1e-9 && !st.tau.is_empty()).then(|| st.tau.iter().map(|t| t / st.v).collect())
     };
+    // A time allowance: every loop here is bounded, but they are nested several deep and each
+    // state solve can be slow (under axial tension a run of a 450 x 750 column did not return
+    // in 25 s, and hung the N-V diagram, which called this at every axial level). When it runs
+    // out, the run ends where it is, unconfirmed. SR_OLD_BUDGET sets the seconds (default 4).
+    let t0 = std::time::Instant::now();
+    let budget = std::env::var("SR_OLD_BUDGET").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(4.0);
+    let mut timed_out = false;
     while tries < 400 {
+        if t0.elapsed().as_secs_f64() > budget {
+            timed_out = true;
+            break;
+        }
         tries += 1;
         let vt = v + dv;
         let mt = vt * mv;
@@ -1744,6 +1772,10 @@ pub fn shear_response_steps(m: &SModel, n_kn: f64, mv: f64, mphi: &MPhiResult, s
                     };
                     let mut found = None;
                     'probe: for f in [1.005, 1.01, 1.02] {
+                        if t0.elapsed().as_secs_f64() > budget {
+                            timed_out = true;
+                            break 'probe;
+                        }
                         let vj = v * f;
                         let starts: [(&[(f64, f64)], Option<(f64, f64)>, Option<&[f64]>); 3] = [
                             (&guesses, start, flow.as_deref()),
@@ -1780,7 +1812,10 @@ pub fn shear_response_steps(m: &SModel, n_kn: f64, mv: f64, mphi: &MPhiResult, s
             }
         }
     }
-    res.confirmed = finished;
+    res.confirmed = finished && !timed_out;
+    if timed_out {
+        res.reason = format!("The load-stepping solver ran out of its time allowance ({:.0} s) before finding the peak.", budget);
+    }
     if res.reason.is_empty() {
         res.reason = "Analysis stopped.".into();
     }
@@ -1979,7 +2014,7 @@ pub fn mv_ratios(points: usize, m_cap: f64, v_cap: f64) -> Vec<f64> {
 /// M = (M/V) x V. The yield plateau is then crossed without stalling, and the capacity is the
 /// true peak of V (V rises, then falls), not the point where a load step stops converging.
 pub fn shear_response_curvature(m: &SModel, n_kn: f64, mv: f64, mphi: &MPhiResult) -> ShearResult {
-    let mut res = ShearResult { mv, points: vec![], reason: String::new(), confirmed: false, rescued: 0, mech: None };
+    let mut res = ShearResult { mv, points: vec![], reason: String::new(), confirmed: false, rescued: 0, mech: None, web_work: None };
     if mphi.points.len() < 2 || mv <= 0.0 {
         res.reason = "No moment-curvature result.".into();
         return res;
@@ -2186,6 +2221,8 @@ struct Run {
     mech: Mechanism,
     confirmed: bool,
     shared: bool,
+    /// the peak state of the run on the diagram's own mesh, to continue a neighbouring ratio from
+    seed: Option<crate::path::Seed>,
 }
 
 fn run_one(m: &SModel, n_kn: f64, a: f64, mphi: &MPhiResult, step_scale: f64, v_cap: f64) -> Run {
@@ -2194,18 +2231,23 @@ fn run_one(m: &SModel, n_kn: f64, a: f64, mphi: &MPhiResult, step_scale: f64, v_
     // ratios use curvature control, shear-dominated ones load control. (The strain-driven
     // strain-driven solver in path.rs is used first; these are its fallback where it stalls.)
     let m_cap = mphi.points.get(mphi.peak).map(|p| p.m).unwrap_or(1.0).max(1e-6);
+    let seed_cell: std::sync::Mutex<Option<crate::path::Seed>> = std::sync::Mutex::new(None);
     let (sr, alt) = with_mesh_retry_sel(m, false, true, &|mm, primary| {
         if !primary {
             return crate::path::shear_path(mm, n_kn, a, mphi);
         }
-        new_or_old(m, n_kn, a, mphi, || {
+        let r = new_or_old(m, n_kn, a, mphi, || {
             if v_cap > 0.0 && a * v_cap / m_cap >= 0.35 {
                 let c = shear_response_curvature(m, n_kn, a, mphi);
                 if c.points.len() > 2 { c } else { shear_response_steps(m, n_kn, a, mphi, step_scale) }
             } else {
                 shear_response_steps(m, n_kn, a, mphi, step_scale)
             }
-        })
+        });
+        if let Ok(mut s) = seed_cell.lock() {
+            *s = crate::path::take_peak_seed();
+        }
+        r
     });
     // events and mechanism read with the layer model the kept run used
     let m = alt.as_ref().unwrap_or(m);
@@ -2243,6 +2285,7 @@ fn run_one(m: &SModel, n_kn: f64, a: f64, mphi: &MPhiResult, step_scale: f64, v_
         mech,
         confirmed: sr.confirmed,
         shared: best.map(|p| p.shared).unwrap_or(false),
+        seed: seed_cell.lock().ok().and_then(|mut s| s.take()),
     }
 }
 
@@ -2295,6 +2338,7 @@ pub fn interaction(m: &SModel, n_kn: f64, mphi: &MPhiResult, points: usize, prog
         runs.extend(run_many(m, n_kn, &extra, mphi, 1.0, v_cap));
         runs.sort_by(|a, b| a.ratio.partial_cmp(&b.ratio).unwrap());
     }
+    continue_between_ratios(m, n_kn, m_cap, &mut runs);
     progress(0.75);
     // A point well below the line through its neighbours is flagged (a diagnostic only: the
     // path-following solver gives one answer per ratio, so re-running would repeat it).
@@ -2670,7 +2714,7 @@ pub fn radial_interaction(sec: &Section, pair: Pair, points: usize, progress: &d
         });
         progress(0.95);
         let pt = |x: f64, y: f64, mech: Mechanism, why: &str| RadialPoint { x, y, mech, confirmed: true, reason: why.into() };
-        let mut pts = vec![pt(end_m.0, -nc0, Mechanism::WebCrushing, "pure compression (uniform strain)")];
+        let mut pts = vec![pt(end_m.0, -nc0, Mechanism::Crushing, "pure compression (uniform strain)")];
         for r in &res {
             pts.push(pt(r.1, r.0, r.3, "moment-curvature at constant axial load"));
         }
@@ -2678,7 +2722,7 @@ pub fn radial_interaction(sec: &Section, pair: Pair, points: usize, progress: &d
         for r in res.iter().rev() {
             pts.push(pt(-r.2, r.0, r.4, "moment-curvature at constant axial load"));
         }
-        pts.push(pt(end_m.0, -nc0, Mechanism::WebCrushing, "pure compression (uniform strain)"));
+        pts.push(pt(end_m.0, -nc0, Mechanism::Crushing, "pure compression (uniform strain)"));
         progress(1.0);
         return Some(RadialDiagram { pair, points: pts });
     }
@@ -2779,7 +2823,12 @@ pub fn radial_interaction(sec: &Section, pair: Pair, points: usize, progress: &d
                             // the load-stepping solver as well (it restarts from scratch past the
                             // drop at cracking, where the strain-driven one can stall): a stall
                             // only ever under-estimates, so the larger peak is kept
-                            let old = if m_const.abs() < 1e-9 { Some(shear_response_steps(mm, nk, 0.0, &mphi, 1.0)) } else { None };
+                            // (the load-stepping solver was run here as well at every level and the
+                            // larger peak kept, for the stalls at cracking the strain-driven solver
+                            // had; that solver now passes cracking on its own, and this one took
+                            // 2-9 s a level and did not return under tension. SR_NV_OLD_CHECK=1 runs
+                            // it again.)
+                            let old = if m_const.abs() < 1e-9 && std::env::var("SR_NV_OLD_CHECK").is_ok() { Some(shear_response_steps(mm, nk, 0.0, &mphi, 1.0)) } else { None };
                             let vpk = |r: &ShearResult| r.points.iter().map(|p| p.v).fold(0.0, f64::max);
                             let (r, alt) = match old {
                                 Some(o) if vpk(&o) > vpk(&r) => (o, None),
@@ -2807,6 +2856,7 @@ pub fn radial_interaction(sec: &Section, pair: Pair, points: usize, progress: &d
             let mut pts = vec![comp];
             pts.extend(got.into_iter().map(|g| g.1));
             pts.push(tens);
+            single_crushing_changeover(&mut pts);
             progress(1.0);
             return Some(RadialDiagram { pair, points: pts });
         }
@@ -2919,13 +2969,39 @@ pub fn radial_interaction(sec: &Section, pair: Pair, points: usize, progress: &d
     // the ends (no shear) from the uniform-strain sweep: a load-stepping run in pure tension
     // stalls at the drop after cracking
     if let Some(first) = pts.first_mut() {
-        *first = RadialPoint { x: -nc0, y: 0.0, mech: Mechanism::WebCrushing, confirmed: true, reason: "pure compression (uniform strain)".into() };
+        *first = RadialPoint { x: -nc0, y: 0.0, mech: Mechanism::Crushing, confirmed: true, reason: "pure compression (uniform strain)".into() };
     }
     if let Some(last) = pts.last_mut() {
         *last = RadialPoint { x: nt0, y: 0.0, mech: Mechanism::LongYield, confirmed: true, reason: "pure tension (uniform strain, peak as the bars yield)".into() };
     }
     progress(1.0);
     Some(RadialDiagram { pair, points: pts })
+}
+
+/// One changeover between axial crushing and a web failure along an N-V curve (points ordered
+/// from compression to tension). Each run tells the two apart by the direction of its
+/// compression against 10 deg, and near the changeover that direction turns slowly - sample
+/// beam: 9.7, 10.0, 10.4, 10.3, 9.6, 11.1, 8.7, 10.4 deg over eight levels of N - so the label
+/// went back and forth five times. The changeover is put where it disagrees with the fewest
+/// runs. A run on the web side that read axial crushing takes the web label of its nearest
+/// neighbour (towards tension first). SR_NV_RAW_LABELS=1 leaves each run's own label.
+fn single_crushing_changeover(pts: &mut [RadialPoint]) {
+    if std::env::var("SR_NV_RAW_LABELS").is_ok() {
+        return;
+    }
+    let web = |m: Mechanism| matches!(m, Mechanism::WebCrushing | Mechanism::WebShear);
+    let idx: Vec<usize> = (0..pts.len()).filter(|&i| pts[i].mech == Mechanism::Crushing || web(pts[i].mech)).collect();
+    let was: Vec<Mechanism> = idx.iter().map(|&i| pts[i].mech).collect();
+    let cost = |k: usize| -> usize { was[..k].iter().filter(|m| web(**m)).count() + was[k..].iter().filter(|m| **m == Mechanism::Crushing).count() };
+    let Some(k) = (0..=idx.len()).min_by_key(|&k| cost(k)) else { return };
+    for (j, &i) in idx.iter().enumerate() {
+        if j < k {
+            pts[i].mech = Mechanism::Crushing;
+        } else if was[j] == Mechanism::Crushing {
+            let near = was[j..].iter().chain(was[k..j].iter().rev()).find(|m| web(**m)).copied();
+            pts[i].mech = near.unwrap_or(Mechanism::WebCrushing);
+        }
+    }
 }
 
 pub fn interaction_both(sec: &Section, n_kn: f64, points: usize, progress: &dyn Fn(f32)) -> Option<Interaction> {
@@ -3096,5 +3172,116 @@ mod envelope_tests {
         let th: Vec<f64> = mv_polar(&env).iter().map(|p| p.0).collect();
         assert!(th.windows(2).all(|w| w[1] <= w[0]), "from negative bending (pi) to positive (0)");
         assert!(env.first().unwrap().0 < 0.0 && env.last().unwrap().0 > 0.0);
+    }
+}
+
+/// How far point `b` falls short of the chord between its neighbours `a` and `c`, measured along
+/// its own direction from the origin, as a fraction (0 when on or outside the chord). Points are
+/// (M, V) scaled by (ms, vs).
+fn short_of_chord(a: (f64, f64), b: (f64, f64), c: (f64, f64), ms: f64, vs: f64) -> f64 {
+    let s = |p: (f64, f64)| (p.0 / ms, p.1 / vs);
+    let (a, b, c) = (s(a), s(b), s(c));
+    let r = b.0.hypot(b.1);
+    if r < 1e-9 {
+        return 0.0;
+    }
+    let u = (b.0 / r, b.1 / r);
+    let d = (c.0 - a.0, c.1 - a.1);
+    let den = u.0 * d.1 - u.1 * d.0;
+    if den.abs() < 1e-14 {
+        return 0.0;
+    }
+    let t = (a.0 * d.1 - a.1 * d.0) / den;
+    if t <= 0.0 {
+        return 0.0;
+    }
+    (1.0 - r / t).max(0.0)
+}
+
+/// Continuation between neighbouring ratios (see `path::shear_path_seeded`). A point that falls
+/// short of the chord between its neighbours by more than 0.4 % is restarted from each
+/// neighbour's peak state on the diagram's mesh; if that reaches a higher shear the point moves
+/// there. Repeated (a low stretch is recovered one point per pass, from its ends inwards) until
+/// nothing changes. Every pass runs its restarts side by side.
+///
+/// Off by default (SR_CONTINUE=1 turns it on). It was written when the shear shares switched
+/// rule at the bars' yield and neighbouring ratios landed on different branches; with the one
+/// smooth rule (`path::smooth_tangent_changes`) those steps are gone at the source, and what
+/// this pass still changes is bending-dominated points that end at the 25 mm/m limit, lifted
+/// 1-3 % on one side of a symmetric diagram and not the other (600 x 600 column: sides within
+/// 0.32 % without it, 2.35 % with; sample beam 0 unconfirmed points without, 3 with).
+fn continue_between_ratios(m: &SModel, n_kn: f64, m_cap: f64, runs: &mut Vec<Run>) {
+    if std::env::var("SR_CONTINUE").is_err() || runs.len() < 3 {
+        return;
+    }
+    let trace = std::env::var("SR_INTER").is_ok();
+    // (point, neighbour, the neighbour's shear when tried): not tried again unless it changed
+    let mut tried: Vec<(usize, usize, f64)> = vec![];
+    for pass in 0..16 {
+        let vs = runs.iter().filter_map(|r| r.peak).map(|p| p.1).fold(0.0, f64::max).max(1e-9);
+        let pk = |i: usize| -> Option<(f64, f64)> { runs.get(i).and_then(|r| r.peak) };
+        let mut cand: Vec<(usize, usize)> = vec![];
+        for i in 0..runs.len() {
+            let Some(b) = pk(i) else { continue };
+            // neighbours along the curve: the pure-shear point mirrors its one neighbour (the
+            // other side of the diagram is solved separately); past the last ratio lies the
+            // bending capacity at no shear
+            let a = if i == 0 { pk(1).map(|p| (-p.0, p.1)) } else { pk(i - 1) };
+            let c = if i + 1 < runs.len() { pk(i + 1) } else { Some((m_cap, 0.0)) };
+            let (Some(a), Some(c)) = (a, c) else { continue };
+            if short_of_chord(a, b, c, m_cap, vs) <= 0.004 {
+                continue;
+            }
+            for j in [i.wrapping_sub(1), i + 1] {
+                if j >= runs.len() || runs[j].seed.is_none() {
+                    continue;
+                }
+                let vj = runs[j].peak.map(|p| p.1).unwrap_or(0.0);
+                if tried.iter().any(|t| t.0 == i && t.1 == j && (t.2 - vj).abs() < 1e-6) {
+                    continue;
+                }
+                tried.push((i, j, vj));
+                cand.push((i, j));
+            }
+        }
+        if cand.is_empty() {
+            break;
+        }
+        type Out = Option<((f64, f64), Mechanism, bool, Option<crate::path::Seed>)>;
+        let outs: Vec<(usize, usize, Out)> = std::thread::scope(|s| {
+            let hs: Vec<_> = cand
+                .iter()
+                .map(|&(i, j)| {
+                    let (a, seed) = (runs[i].ratio, runs[j].seed.as_ref());
+                    s.spawn(move || {
+                        let out = seed.and_then(|sd| crate::path::shear_path_seeded(m, n_kn, a, sd)).and_then(|r| {
+                            let best = r.points.iter().max_by(|x, y| x.v.partial_cmp(&y.v).unwrap())?;
+                            let peak = (best.m, best.v);
+                            Some((peak, mechanism(m, &r), crate::path::failure_proof_m(Some(m), &r, false), crate::path::take_peak_seed()))
+                        });
+                        (i, j, out)
+                    })
+                })
+                .collect();
+            hs.into_iter().filter_map(|h| h.join().ok()).collect()
+        });
+        let mut changed = false;
+        for (i, j, out) in outs {
+            let Some((peak, mech, proof, seed)) = out else { continue };
+            let old = runs[i].peak.map(|p| p.1).unwrap_or(0.0);
+            if trace {
+                eprintln!("  continuation pass {} flip {}: a {:.3} m from a {:.3} m: V {:.1} (was {:.1})", pass, m.flip, runs[i].ratio, runs[j].ratio, peak.1, old);
+            }
+            if peak.1 > 1.002 * old {
+                runs[i].peak = Some(peak);
+                runs[i].mech = mech;
+                runs[i].confirmed = proof;
+                runs[i].seed = seed;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 }

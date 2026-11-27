@@ -1482,6 +1482,7 @@ impl App {
             Mechanism::LongHardening => Color32::from_rgb(0, 110, 110),
             Mechanism::WebShear => Color32::from_rgb(230, 120, 0),
             Mechanism::WebCrushing => Color32::from_rgb(170, 0, 0),
+            Mechanism::Crushing => Color32::from_rgb(130, 0, 150),
             Mechanism::Unclear => Color32::from_rgb(130, 130, 130),
         };
         let clip = painter.with_clip_rect(fr.plot.expand(4.0));
@@ -1810,7 +1811,7 @@ impl App {
             RichText::new(
                 "Shear in two directions: the shear acts at an angle θ from the vertical, Vy = V cos θ (vertical, with Mx) and \
                  Vx = V sin θ (sideways, with My), with the moment M = (M/V) × V at the same angle. Each direction is a full \
-                 sectional shear analysis (MCFT) of the section turned to it.",
+                 sectional shear analysis (MCFT) of the section turned to it. Neither component may exceed the capacity along \n                 its own axis; a direction held to that limit is drawn hollow.",
             )
             .strong(),
         );
@@ -1952,12 +1953,19 @@ impl App {
             let c = match r.mech {
                 Some(Mechanism::WebShear) => Color32::from_rgb(230, 120, 0),
                 Some(Mechanism::WebCrushing) => Color32::from_rgb(170, 0, 0),
+                Some(Mechanism::Crushing) => Color32::from_rgb(130, 0, 150),
                 Some(Mechanism::LongYield) => Color32::from_rgb(0, 150, 0),
                 Some(Mechanism::LongHardening) => Color32::from_rgb(0, 110, 110),
                 Some(Mechanism::Flexure) => Color32::from_rgb(20, 60, 200),
                 _ => Color32::from_rgb(130, 130, 130),
             };
-            clip.circle_filled(fr.map(r.vx(), r.vy()), 4.0, c);
+            // a direction held to an axis capacity is drawn hollow
+            if r.limited.is_some() {
+                clip.circle_filled(fr.map(r.vx(), r.vy()), 4.0, Color32::WHITE);
+                clip.circle_stroke(fr.map(r.vx(), r.vy()), 4.0, Stroke::new(1.6, c));
+            } else {
+                clip.circle_filled(fr.map(r.vx(), r.vy()), 4.0, c);
+            }
         }
         // values read off the curves under the pointer: series 0 nominal, 1 the ellipse, then the
         // design contour and the ACI rule (if shown), then the demand line and its point
@@ -2004,7 +2012,19 @@ impl App {
             painter.text(
                 Pos2::new(lx, ly),
                 Align2::LEFT_TOP,
-                format!("{:5.1} {:7.1} {:7.1} {:7.1} {:7.1} {:7.1}  {}", r.theta, r.v, r.vx(), r.vy(), r.m, r.av, mech.split(" (").next().unwrap_or(mech)),
+                format!(
+                    "{:5.1} {:7.1} {:7.1} {:7.1} {:7.1} {:7.1}  {}",
+                    r.theta,
+                    r.v,
+                    r.vx(),
+                    r.vy(),
+                    r.m,
+                    r.av,
+                    match r.limited {
+                        Some(axis) => format!("{} capacity (analysis {:.1})", axis, r.v_model),
+                        None => mech.split(" (").next().unwrap_or(mech).to_string(),
+                    }
+                ),
                 FontId::monospace(10.5),
                 Color32::DARK_GRAY,
             );
@@ -2229,6 +2249,7 @@ impl App {
                 Mechanism::LongHardening => Color32::from_rgb(0, 110, 110),
                 Mechanism::WebShear => Color32::from_rgb(230, 120, 0),
                 Mechanism::WebCrushing => Color32::from_rgb(170, 0, 0),
+                Mechanism::Crushing => Color32::from_rgb(130, 0, 150),
                 Mechanism::Unclear => Color32::from_rgb(130, 130, 130),
             };
             let at = fr.map(p.x, p.y);

@@ -326,9 +326,22 @@ fn flow_shape_inner(m: &SModel, sz: f64, ec: f64, phi: f64, g: &[f64], anchor: &
     static SEC: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
     let mode = *SEC.get_or_init(|| match std::env::var("SR_FLOW_SECANT").as_deref() {
         Ok("off") | Ok("0") => 0,
-        Ok("1") | Ok("always") => 1,
-        _ => 2,
+        Ok("1") | Ok("always") | Ok("secant") => 1,
+        Ok("tangent") => 3,
+        Ok("state") => 4,
+        Ok("hybrid") => 2,
+        _ => 3,
     });
+    if mode == 4 {
+        let (dl, db) = state_changes(m, sz, ec, phi, g, anchor);
+        let tau = flow_from_changes(m, &dl, &db, 1.0);
+        return shares_from_tau(m, &tau);
+    }
+    if mode == 3 {
+        let (dl, db) = smooth_tangent_changes(m, sz, ec, phi, g, anchor);
+        let tau = flow_from_changes(m, &dl, &db, 1.0);
+        return shares_from_tau(m, &tau);
+    }
     let use_secant = match mode {
         1 => true,
         2 => m.bars.iter().any(|b| match b.steel {
@@ -343,7 +356,7 @@ fn flow_shape_inner(m: &SModel, sz: f64, ec: f64, phi: f64, g: &[f64], anchor: &
         return shares_from_tau(m, &tau);
     }
     let phic = 4.0 * m.conc.ecr / m.h;
-    let hphi = 0.04 * (phi * phi + phic * phic).sqrt();
+    let hphi = flow_h() * (phi * phi + phic * phic).sqrt();
     let mut sides = vec![];
     for sgn in [1.0, -1.0] {
         let ph = phi + sgn * 0.5 * hphi;
@@ -789,9 +802,9 @@ impl<'a> Sys<'a> {
         (r, ev)
     }
     /// slope matrix by direct perturbation of every unknown (scaled units)
-    fn jac(&self, y: &[f64], q: &[f64], r: &[f64]) -> Vec<f64> {
+    fn jac(&self, y: &[f64], q: &[f64], r: &[f64], ev0: &SecEval) -> Vec<f64> {
         let t0 = std::time::Instant::now();
-        let out = self.jac_inner(y, q, r);
+        let out = self.jac_inner(y, q, r, ev0);
         prof_add(0, t0);
         out
     }
@@ -817,7 +830,7 @@ impl<'a> Sys<'a> {
     /// share of the axial force and moment), so all the layers' shear strains can be perturbed
     /// at once and each layer's response read separately; likewise all transverse strains. Only
     /// the centroid strain, the curvature and the load need their own evaluation.
-    fn jac_inner(&self, y: &[f64], q: &[f64], r: &[f64]) -> Vec<f64> {
+    fn jac_inner(&self, y: &[f64], q: &[f64], r: &[f64], ev0: &SecEval) -> Vec<f64> {
         if std::env::var("SR_JACFD").is_ok() {
             return self.jac_full(y, q, r);
         }
@@ -827,18 +840,66 @@ impl<'a> Sys<'a> {
         let nr = r.len();
         let mut jj = vec![0.0; nr * nu];
         let hof = |k: usize| 1e-6 * (1.0 + y[k].abs());
-        // centroid strain, curvature and load: plain columns
-        for c in [0, 1, nu - 1] {
-            let h = hof(c);
-            let mut yp = y.to_vec();
-            yp[c] += h;
-            let (rp, _) = self.resid(&yp, q);
-            for rr in 0..nr {
-                jj[rr * nu + c] = (rp[rr] - r[rr]) / h;
+        // Centroid strain, curvature and load. The load enters the equations linearly (N, M and
+        // V are constant + factor x increment), so its column is exact. The centroid strain and
+        // the curvature act on a layer only through its own longitudinal strain,
+        // ex = ec - phi (z - zc), so one evaluation with every layer's ex perturbed (and each
+        // bar's tangent) gives both columns by the chain rule. With the state's own evaluation
+        // passed in, the matrix takes 3 section evaluations instead of 6. (The longitudinal
+        // reserve, when on, depends on the whole strain plane: the plain columns are used then.
+        // SR_JAC_PLAIN=1 forces them.)
+        static PLAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let (ec, phi, g, ez, _) = self.unpack(y);
+        let plain = *PLAIN.get_or_init(|| std::env::var("SR_JAC_PLAIN").is_ok()) || m.long_reserve(ec, phi).is_some();
+        if plain {
+            for c in [0, 1, nu - 1] {
+                let h = hof(c);
+                let mut yp = y.to_vec();
+                yp[c] += h;
+                let (rp, _) = self.resid(&yp, q);
+                for rr in 0..nr {
+                    jj[rr * nu + c] = (rp[rr] - r[rr]) / h;
+                }
+            }
+        } else {
+            let (s0, s1, sp) = (self.scale[0], self.scale[1], self.scale[nu - 1]);
+            for i in 0..nl {
+                let l = &m.layers[i];
+                let ar = l.b * l.t;
+                let ex = m.strain(ec, phi, l.z);
+                let hx = 2e-9 * (1.0 + ex.abs() / 0.002);
+                let (f1, o1) = layer_point(m, i, self.sz, ex + hx, g[i], ez[i], None);
+                let dz = -(l.z - m.zc); // d ex / d phi
+                let dsx = (o1.sx - ev0.outs[i].sx) * ar / hx;
+                let dtau = (o1.tau - ev0.outs[i].tau) * ar / hx / self.tol[2 + i];
+                let dtr = (f1 - ev0.trans[i]) * ar / hx / self.tol[2 + nl + i];
+                jj[0] += dsx / self.tol[0] / s0;
+                jj[1] += dsx * dz / self.tol[0] / s1;
+                jj[nu] += -dsx * (l.z - m.zc) / self.tol[1] / s0;
+                jj[nu + 1] += -dsx * (l.z - m.zc) * dz / self.tol[1] / s1;
+                jj[(2 + i) * nu] = dtau / s0;
+                jj[(2 + i) * nu + 1] = dtau * dz / s1;
+                jj[(2 + nl + i) * nu] = dtr / s0;
+                jj[(2 + nl + i) * nu + 1] = dtr * dz / s1;
+            }
+            for (k, b) in m.bars.iter().enumerate() {
+                let e = ev0.bar_e[k];
+                let h = 2e-9 * (1.0 + e.abs() / 0.002);
+                let kt = (b.steel.stress(e + h) - ev0.bar_s[k]) / h * b.area;
+                let dz = -(b.z - m.zc);
+                jj[0] += kt / self.tol[0] / s0;
+                jj[1] += kt * dz / self.tol[0] / s1;
+                jj[nu] += -kt * (b.z - m.zc) / self.tol[1] / s0;
+                jj[nu + 1] += -kt * (b.z - m.zc) * dz / self.tol[1] / s1;
+            }
+            let c = nu - 1;
+            jj[c] = -self.lo.dn / self.tol[0] / sp;
+            jj[nu + c] = -self.lo.dm / self.tol[1] / sp;
+            for i in 0..nl {
+                jj[(2 + i) * nu + c] = -q[i] * self.lo.dv / self.tol[2 + i] / sp;
             }
         }
         // the layers' own unknowns, a block at a time
-        let (_, ev0) = self.resid(y, q);
         for block in 0..2 {
             let off = 2 + block * nl;
             let mut yp = y.to_vec();
@@ -911,6 +972,13 @@ fn correct(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], q: &[f64])
     let t0 = std::time::Instant::now();
     let out = if std::env::var("SR_NEWTON").is_ok() { correct_newton(sys, yk, w, target, y0, q) } else { correct_lm(sys, yk, w, target, y0, q) };
     prof_add(1, t0);
+    lmstat(out.is_some(), out.as_ref().map(|o| o.2).unwrap_or(40), t0.elapsed().as_micros() as u64);
+    if std::env::var("SR_LMTRACE").is_ok() {
+        let a = LMF.with(|c| c.get());
+        let n = a[40] as usize;
+        let g = |k: usize| if k <= n { a[k.min(39)] } else { -1.0 };
+        eprintln!("LMT {} {} {:.3e} {:.3e} {:.3e} {:.3e} {:.3e} {:.3e}", if out.is_some() { "ok" } else { "fail" }, n, g(0), g(4), g(8), g(12), g(16), a[n.min(39)]);
+    }
     out
 }
 
@@ -934,12 +1002,25 @@ fn correct_lm(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], q: &[f6
     let mut mu = 1e-3;
     let mut polished = 0;
     let dense_only = std::env::var("SR_DENSE_LU").is_ok();
+    let mut hist = [0.0f64; 40];
+    static EARLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let lm_early = *EARLY.get_or_init(|| std::env::var("SR_NO_LM_EARLY").is_err());
     for it in 0..40 {
+        LMF.with(|c| { let mut a = c.get(); if it < 40 { a[it.min(39)] = f; } a[40] = it as f64; c.set(a); });
+        // A hopeless start is given up early: from iteration 12 on, a merit still above 1e4 (rows
+        // out by about 100 tolerances) that has not halved over the last 8 iterations. Measured on
+        // a column (30 500 calls): failed calls took 31 s of the corrector's 41 s, 85 % of them
+        // running all 40 iterations; this rule ends 5 700 of the 9 700 failures early and would
+        // have ended 8 of the 20 800 calls that went on to converge. SR_NO_LM_EARLY=1 turns it off.
+        hist[it] = f;
+        if it >= 12 && it % 4 == 0 && f > 1e4 && f > 0.5 * hist[it - 8] && lm_early {
+            return None;
+        }
         let c = cons(&y);
-        if within(sys, &r, &ev, 4.0) && (c / wn).abs() < 1e-6 {
+        if within(sys, &r, &ev, 4.0 * tolk()) && (c / wn).abs() < 1e-6 {
             return Some((y, ev, it));
         }
-        let j = sys.jac(&y, q, &r);
+        let j = sys.jac(&y, q, &r, &ev);
         let nr = r.len();
         let wrow: Vec<f64> = w.iter().map(|x| wc * x).collect();
         // normal equations of [J; wc w] d = [r; wc c]: kept in the section system's own
@@ -1027,7 +1108,7 @@ fn correct_lm(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], q: &[f6
             // (8 tolerances = 0.08 % of the section's axial and moment scales, 0.04 MPa per
             // layer: the slope matrix is taken by perturbation and the crack check has rounded
             // corners, so the last few tolerances are sometimes out of reach)
-            if within(sys, &r, &ev, 8.0) && (cons(&y) / wn).abs() < 1e-4 {
+            if within(sys, &r, &ev, 8.0 * tolk()) && (cons(&y) / wn).abs() < 1e-4 {
                 return Some((y, ev, it));
             }
             if std::env::var("SR_PATH").is_ok() {
@@ -1037,7 +1118,7 @@ fn correct_lm(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], q: &[f6
             return None;
         }
     }
-    if std::env::var("SR_PATH").is_ok() && !within(sys, &r, &ev, 4.0) {
+    if std::env::var("SR_PATH").is_ok() && !within(sys, &r, &ev, 4.0 * tolk()) {
         let worst = r.iter().enumerate().fold((0, 0.0f64), |w, (k, x)| if x.abs() > w.1 { (k, x.abs()) } else { w });
         let over = r.iter().filter(|x| x.abs() >= 4.0).count();
         eprintln!("   lm: 40 iterations, merit {:.3e} worst row {} {:.3e} ({} rows over 4, mu {:.1e})", f, worst.0, worst.1, over, mu);
@@ -1045,7 +1126,7 @@ fn correct_lm(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], q: &[f6
     // (Accepting the 8-tolerance band here too was tried, for runs crawling on the bars' yield
     // plateau: it moved them only a little further and shifted other runs onto other branches,
     // --check-mechanics 2.43 -> 2.59 %, so it stays at 4.)
-    if !within(sys, &r, &ev, 4.0) && std::env::var("SR_NO_POLISH").is_err() {
+    if !within(sys, &r, &ev, 4.0 * tolk()) && std::env::var("SR_NO_POLISH").is_err() {
         // out of iterations while crawling: the exact transverse strains may finish it
         let pol = polish_transverse(sys, &y, q);
         if std::env::var("SR_PATH").is_ok() {
@@ -1058,12 +1139,12 @@ fn correct_lm(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], q: &[f6
             }
         }
         if let Some((yp, rp, ep)) = pol {
-            if within(sys, &rp, &ep, 4.0) && (cons(&yp) / wn).abs() < 1e-6 {
+            if within(sys, &rp, &ep, 4.0 * tolk()) && (cons(&yp) / wn).abs() < 1e-6 {
                 return Some((yp, ep, 40));
             }
         }
     }
-    (within(sys, &r, &ev, 4.0)).then_some((y, ev, 40))
+    (within(sys, &r, &ev, 4.0 * tolk())).then_some((y, ev, 40))
 }
 
 thread_local! {
@@ -1083,6 +1164,18 @@ fn within(sys: &Sys, r: &[f64], ev: &SecEval, k: f64) -> bool {
     // let other runs settle on other branches earlier on (--check-mechanics 2.43 -> 2.53 %)
     let abs_only = *ABS.get_or_init(|| std::env::var("SR_ABS_TOL").is_ok()) || !REL_TOL.with(|c| c.get());
     let nl = sys.nl();
+    // The whole shear: every layer may be within its own band while their errors add up (60
+    // layers at 4 tolerances each are 1.3 % of the shear scale), so a state would balance a range
+    // of loads - a column on 60 layers took 750.0 and then 754.6 kN at one and the same
+    // deformation. The layers' shear errors, added with their signs, must be within `k` of one
+    // layer's band (0.04 % of the shear scale at k = 4). SR_NO_SUM_TOL=1 turns it off.
+    static SUM: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *SUM.get_or_init(|| std::env::var("SR_NO_SUM_TOL").is_err()) {
+        let s: f64 = r[2..2 + nl].iter().sum();
+        if s.abs() >= k {
+            return false;
+        }
+    }
     r.iter().enumerate().all(|(j, x)| {
         let lim = if !abs_only && j >= 2 + nl && j < 2 + 2 * nl {
             let i = j - 2 - nl;
@@ -1090,6 +1183,16 @@ fn within(sys: &Sys, r: &[f64], ev: &SecEval, k: f64) -> bool {
             let s2 = ev.outs.get(i).map(|o| o.s2.min(0.0).abs()).unwrap_or(0.0);
             let rel = 0.005 * s2 * l.b * l.t / sys.tol[j];
             k * (rel / 4.0).max(1.0)
+        } else if j < 2 {
+            // The axial force and the moment are held closer than the layers' own equations: their
+            // band is sized from the section (1e-4 f'c A and f'c A h), which next to pure shear is
+            // large beside the loads themselves - sample beam, M/V 0.11 m: 4 tolerances are
+            // 1.7 kNm on a moment of 30 kNm, so with the weak bars at yield the load was accepted
+            // 5 kN above what the section balances at that curvature (280.3 against 275 kN).
+            // Tightening it was tried (SR_NM_TOL=0.25, 0.1): the overshoot shrank (280.3 -> 276.4)
+            // but more runs ended in solver stops (column, both orientations: largest difference
+            // 1.9 -> 5.1 %), so the factor stays at 1.
+            k * nm_tol()
         } else {
             k
         };
@@ -1131,7 +1234,7 @@ fn correct_newton(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], q: 
         if r.iter().all(|x| x.abs() < 4.0) && (c / wn).abs() < 1e-9 {
             return Some((y, ev, it));
         }
-        let mut a = sys.jac(&y, q, &r);
+        let mut a = sys.jac(&y, q, &r, &ev);
         a.extend_from_slice(w);
         let mut b = r.clone();
         b.push(c);
@@ -1230,6 +1333,9 @@ fn solve_with_flow_b(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], 
     // best pass so far (smallest change of the shares): the state is balanced exactly for the
     // shares it used
     let mut best: Option<(f64, Vec<f64>, SecEval, Vec<f64>)> = None;
+    // the last pass that balanced: its state, the shares it used and the shares it gives
+    let mut good: Option<(Vec<f64>, Vec<f64>, Vec<f64>)> = None;
+    let mut backoffs = 0;
     for _ in 0..(if rebranch { 40 } else { 20 }) {
         let attempt = if rebranch {
             let p = y_try[y_try.len() - 1] / sys.scale[y_try.len() - 1];
@@ -1240,6 +1346,22 @@ fn solve_with_flow_b(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], 
         let (y, ev, _) = match attempt {
             Some(x) => x,
             None => {
+                // A pass that does not balance after earlier ones did: the update of the shares
+                // overshot (a prestressed T-beam at web cracking: two passes balanced, the third
+                // did not, and the whole step was given up). Go back to the last pass that
+                // balanced and take half the update. SR_NO_SHARE_BACKOFF=1 turns it off.
+                if let (Some((yg, qg, qng)), true) = (&good, backoffs < 4 && share_backoff(rebranch)) {
+                    backoffs += 1;
+                    relax *= 0.5;
+                    qq = qg.iter().zip(qng).map(|(a, b)| a + relax * (b - a)).collect();
+                    y_try = if rebranch {
+                        let p = yg[yg.len() - 1] / sys.scale[yg.len() - 1];
+                        branch_guess(sys, yg, &qq, p).unwrap_or_else(|| yg.clone())
+                    } else {
+                        yg.clone()
+                    };
+                    continue;
+                }
                 if std::env::var("SR_CAND").is_ok() && rebranch {
                     eprintln!("   branch: corrector failed");
                 }
@@ -1255,6 +1377,7 @@ fn solve_with_flow_b(sys: &Sys, yk: &[f64], w: &[f64], target: f64, y0: &[f64], 
         if delta < 3e-3 {
             return Some((y, ev, qn));
         }
+        good = Some((y.clone(), qq.clone(), qn.clone()));
         if rebranch && best.as_ref().map(|b| delta < b.0).unwrap_or(true) {
             best = Some((delta, y.clone(), ev, qq.clone()));
         }
@@ -1474,6 +1597,10 @@ fn correct_condensed(sys: &Sys, yk: &[f64], w: &[f64], target: f64, base: &[f64]
     // from the present plane first; then, as for flexural cracking (here: a flange in tension
     // cracking while the web takes its shear), the smallest curvature jump from which it balances
     let starts = [1.0, 1.3, 2.0, 3.0, 5.0, 8.0];
+    // (the rescue tried early, at a large step, uses the present plane only: if that does not
+    // balance, a smaller step is the next thing to try, and each further start costs a full
+    // inner iteration - 224 failed calls took 50 s on a column, 225 ms each)
+    let starts = if QUICK_RESCUE.with(|c| c.get()) { &starts[..1] } else { &starts[..] };
     for (k, f) in starts.iter().enumerate() {
         let x0 = [base[0], base[1] * f];
         if let Some(out) = condensed_from(sys, yk, w, target, base, q, x0, nn, mm, &eval) {
@@ -1575,6 +1702,7 @@ fn layer_at_capacity(sys: &Sys, y: &[f64], ev: &SecEval) -> Option<(usize, f64, 
     let (ec, phi, g, _, _) = sys.unpack(y);
     let rxs = m.long_reserve(ec, phi);
     let mut worst: Option<(usize, f64, f64)> = None;
+    let (mut reserve, mut carried) = (0.0f64, 0.0f64);
     for (i, o) in ev.outs.iter().enumerate() {
         let tau = o.tau.abs();
         if tau < 0.05 || g[i].abs() < 1e-9 {
@@ -1597,8 +1725,28 @@ fn layer_at_capacity(sys: &Sys, y: &[f64], ev: &SecEval) -> Option<(usize, f64, 
         if std::env::var("SR_CAP").is_ok() && best < 1.3 * tau {
             eprintln!("   capacity: layer {} z {:.0} rho_z {:.4} tau {:.3} at most {:.3} ({:.1} % reserve)", i, m.layers[i].z, m.layers[i].rho_z, tau, best, 100.0 * (best / tau - 1.0));
         }
+        reserve += (best - tau).max(0.0) * m.layers[i].b * m.layers[i].t;
+        carried += tau * m.layers[i].b * m.layers[i].t;
         if best <= 1.02 * tau && worst.map(|w| tau > w.1).unwrap_or(true) {
             worst = Some((i, tau, best));
+        }
+    }
+    // A layer crossed by stirrups that is at its limit holds its stress while it deforms, and
+    // the shear flow moves to the layers that have more to give (the dual section is taken
+    // again at every state), so one such layer at its limit is not the section's failure:
+    // that needs the web as a whole to have no more than 2 % left. A 600 x 750 column, M/V
+    // 0.26 m, was ended at 1226 kN with nine layers 11-29 % short of their limits (60 kN
+    // between them); at 0.24 m every layer was at its limit, 1258 kN. A layer without
+    // stirrups softens once past its peak, so it still ends the run on its own.
+    // Measured: no capacity changed (shear-strain control from such a state only falls), while
+    // the runs lost their proof of failure and went to re-meshing (diagram 4.5 -> 9.6 s), so
+    // this is off by default; SR_WEB_RESERVE=1 turns it on.
+    if let Some((i, _, _)) = worst {
+        if m.layers[i].rho_z > 0.0 && reserve > 0.02 * carried && std::env::var("SR_WEB_RESERVE").is_ok() {
+            if std::env::var("SR_CAP").is_ok() {
+                eprintln!("   capacity: layer {} is at its limit but the web has {:.1} % left: not the section's failure", i, 100.0 * reserve / carried.max(1e-9));
+            }
+            return None;
         }
     }
     worst
@@ -1710,9 +1858,18 @@ fn load_levels_cap(
     wv[iv] = 1.0;
     let mut dv: f64 = 0.05; // in scaled V units (about 5 % of the shear scale)
     let (dv_min, dv_max) = (0.003, 0.12);
+    // The largest shear strain of any layer that matters. A sliver of a layer (under a quarter of
+    // the average layer area: the tip of a turned or round section) is left out: its equations are
+    // held to the same force tolerance as a full layer, which for a few square centimetres is
+    // about 1 MPa, so its strain is not really determined, and one such layer running away (a
+    // 450 x 750 column turned 35 degrees, 80 layers: "95 000") ended the run at 554 kN as "very
+    // large shear strain" where 40 layers gave 1359 kN. SR_ALL_LAYERS_GMAX=1: every layer.
+    let mean_area = m.area / nl.max(1) as f64;
+    let all_layers = std::env::var("SR_ALL_LAYERS_GMAX").is_ok();
+    let counts: Vec<bool> = m.layers.iter().map(|l| all_layers || l.b * l.t >= 0.25 * mean_area).collect();
     let gmax_of = |y: &[f64]| -> f64 {
         let (_, _, g, _, _) = sys.unpack(y);
-        g.iter().fold(0.0f64, |a, b| a.max(b.abs()))
+        g.iter().zip(&counts).filter(|(_, c)| **c).fold(0.0f64, |a, (b, _)| a.max(b.abs()))
     };
     // Under bending, once the web has cracked, a load step should deform the section: a balanced
     // state at a higher shear whose curvature and total web shear strain both grew by less than a
@@ -1722,7 +1879,13 @@ fn load_levels_cap(
     // no continuation, against 690 kN at M/V 0.2195 m).
     // (only where the moment grows with the load: with the moment held, the curvature need not grow)
     let bending_run = sys.lo.dm.abs() > 50.0;
-    let no_stagnant = std::env::var("SR_NO_STAGNANT").is_ok();
+    // Off by default since the driven fallbacks (curvature, then the web's shear strains) took
+    // over what it was for: next to yield it also refused true small steps, and the rescue then
+    // jumped far along the yield plateau past the peak (sample beam, M/V -0.10 m: 268.4 kN
+    // between 280.3 at -0.11 m and 273.5 at -0.09 m; 284.7 without it). All four benchmark
+    // sections and --check-mechanics (1.84 -> 1.78 %) are the same or better without it.
+    // SR_STAGNANT=1 turns it back on.
+    let no_stagnant = std::env::var("SR_STAGNANT").is_err();
     let stagnant = |a: &[f64], b: &[f64]| -> bool {
         if no_stagnant || !bending_run || gmax_of(a) < 1e-3 {
             return false;
@@ -1753,6 +1916,41 @@ fn load_levels_cap(
         let dg = (s1 - s0) / s1.max(1e-12);
         dphi < 0.25 * rise && dg < 0.25 * rise
     };
+    // One layer running away on its own: the largest shear strain more than doubles (and by more
+    // than 2 mm/m) while the web's shear strains as a whole grow by less than half. A band of
+    // crushing or slip is not one slice of the section whose thickness is the mesh's, so such a
+    // state depends on the number of layers, and a run that takes it peaks lower than one
+    // whose web deforms together (600 x 750 column under 16 700 kN: 2072 kN after a jump of one
+    // layer from 2.2 to 12.4 mm/m; 2140 kN under 15 500 kN with the web deforming as a whole;
+    // 40, 60 and 80 layers 5 % apart). It is refused at any step size and the run goes to the
+    // fallbacks that drive the whole web. SR_ALLOW_ONE_LAYER=1: taken on small steps, as before.
+    let one_layer_ok = std::env::var("SR_ALLOW_ONE_LAYER").is_ok();
+    let gsum_of = |y: &[f64]| -> f64 {
+        let (_, _, g, _, _) = sys.unpack(y);
+        g.iter().zip(&counts).filter(|(_, c)| **c).map(|(b, _)| b.abs()).sum()
+    };
+    let one_layer = |a: &[f64], b: &[f64]| -> bool {
+        !one_layer_ok && gmax_of(b) > 2.0 * gmax_of(a) + 0.002 && gsum_of(b) < 1.5 * gsum_of(a)
+    };
+    // A layer without ties whose transverse strain has run away. Such a layer has two balanced
+    // states under next to no shear: whole, or split wide open and carrying nothing (no
+    // transverse stress either way). Nothing in the loading leads to the second; the rescue's
+    // guesses that scale every strain up reach it, and with the cover's axial load gone to the
+    // rest of the section the run goes on to a different, higher, peak: 600 x 750 column under
+    // 14 600 kN, 2174 kN with the two outer layers at 113 and 134 mm/m and 1.7 MPa, against 1977
+    // kN under 14 400 kN with them whole at 34 MPa. A state with an untied layer over 25 mm/m
+    // across is refused everywhere a state is accepted. SR_ALLOW_SPLIT_COVER=1 turns this off.
+    let split_ok = std::env::var("SR_ALLOW_SPLIT_COVER").is_ok();
+    let split = |y: &[f64]| -> bool {
+        if split_ok {
+            return false;
+        }
+        let (_, _, _, ez, _) = sys.unpack(y);
+        ez.iter().zip(&m.layers).zip(&counts).any(|((e, l), c)| *c && l.rho_z <= 0.0 && e.abs() > 0.025)
+    };
+    // The most deformed state taken so far (by its share-weighted shear strain), for the
+    // second-order work check of load-controlled steps (`work_negative`).
+    let mut most: Option<(Vec<f64>, f64)> = None;
     let mut steps = 0;
     let mut drops = 0;
     let mut peak_state: Option<SectionState> = None;
@@ -1788,6 +1986,9 @@ fn load_levels_cap(
                 continue;
             }
         }
+        if found.as_ref().map(|c| one_layer(&yk, &c.0) || split(&c.0) || work_negative(sys, &most, &c.0, &c.2)).unwrap_or(false) {
+            found = None;
+        }
         // a step that carries more load without deforming more is not on the loading path
         if found.as_ref().map(|c| stagnant(&yk, &c.0)).unwrap_or(false) {
             if dv > 4.0 * dv_min {
@@ -1796,7 +1997,9 @@ fn load_levels_cap(
             }
             found = None;
         }
-        if found.is_none() && dv > 4.0 * dv_min {
+        // (SR_HALVE_FIRST=1: the earlier order, a smaller step before the cracking rescue)
+        let big = dv > 4.0 * dv_min;
+        if found.is_none() && big && std::env::var("SR_HALVE_FIRST").is_ok() {
             // try a smaller step before looking for a jump
             dv *= 0.5;
             continue;
@@ -1810,22 +2013,49 @@ fn load_levels_cap(
             .last()
             .map(|p| p.bars.iter().zip(&m.bars).all(|(b, mb)| b.1.abs() < 0.98 * mb.steel.fy() / mb.steel.modulus()))
             .unwrap_or(true);
-        if found.is_none() && sys.lo.dv.abs() > 0.0 && pre_yield && std::env::var("SR_NO_BRANCH_GUESS").is_err() {
+        // Not with a tension bar at 95 % of yield or more in a run whose moment grows with the load:
+        // there the next states lie along the yield plateau, which curvature control follows, while
+        // a guess that balances lands far beyond it - sample beam, M/V 4 m: from 5.3 to 70.7 rad/km,
+        // past the top of the moment-curvature curve, and then up its falling side backwards to
+        // 86.1 kN at the 25 mm/m limit. SR_JUMP_AT_YIELD=1: the guesses are tried there too.
+        let at_yield = sys.lo.dm.abs() > 50.0 && std::env::var("SR_JUMP_AT_YIELD").is_err() && {
+            let (ec0, phi0, _, _, _) = sys.unpack(&yk);
+            m.bars.iter().any(|b| {
+                let e = m.strain(ec0, phi0, b.z) + b.pre;
+                let tension_side = -(b.z - m.zc) * sys.lo.dm.signum() > 0.0;
+                tension_side && matches!(b.steel, SteelProps::Rebar { .. }) && e > 0.95 * b.steel.fy() / b.steel.modulus()
+            })
+        };
+        if found.is_none() && !at_yield && sys.lo.dv.abs() > 0.0 && (pre_yield || std::env::var("SR_BRANCH_PRE_YIELD_ONLY").is_err()) && std::env::var("SR_NO_BRANCH_GUESS").is_err() {
             // first: every layer moved to the nearest shear strain that carries its share of the
             // new load (through its cracking dip where it must), see `branch_guess`
             let p_new = (yk[iv] + dv) / sys.scale[iv];
             if let Some(y0) = branch_guess(sys, &yk, &q, p_new) {
+                let tb = std::time::Instant::now();
+                QUICK_RESCUE.with(|c| c.set(big));
                 let got = solve_with_flow_b(sys, &yk, &wv, dv, &y0, &q, true);
+                QUICK_RESCUE.with(|c| c.set(false));
+                BRSTAT[if big { 0 } else { 2 } + if got.is_some() { 0 } else { 1 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                BRSTAT[if big { 4 } else { 6 } + if got.is_some() { 0 } else { 1 }].fetch_add(tb.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                 if std::env::var("SR_CAND").is_ok() {
                     eprintln!("   cand branch guess -> {}", got.as_ref().map(|c| format!("gmax {:.5}", gmax_of(&c.0))).unwrap_or("none".into()));
                 }
-                if let Some(c) = got.filter(|c| gmax_of(&c.0) <= 0.025 && !stagnant(&yk, &c.0)) {
+                // (a large step is not allowed a large jump: that is left to a smaller step)
+                let far = |c: &(Vec<f64>, SecEval, Vec<f64>)| big && gmax_of(&c.0) > 2.0 * gmax_of(&yk) + 0.002;
+                if let Some(c) = got.filter(|c| gmax_of(&c.0) <= 0.025 && !stagnant(&yk, &c.0) && !far(c) && !one_layer(&yk, &c.0) && !split(&c.0) && !work_negative(sys, &most, &c.0, &c.2)) {
                     res.rescued += 1;
                     found = Some(c);
                 }
             }
         }
-        if found.is_none() {
+        // The cracking rescue comes before halving the step: while the web cracks layer by layer
+        // (a circular section, each layer its own width) every step over about 0.4 kN failed and
+        // was halved, 136 load steps for 50 kN; the rescue takes such a step in one.
+        if found.is_none() && big {
+            dv *= 0.5;
+            continue;
+        }
+        if found.is_none() && !at_yield {
             // further-deformed guesses at the same load step
             let tmax = tk.iter().skip(2).take(2 * nl).fold(0.0f64, |a, b| a.max(b.abs())).max(1e-12);
             let mut cands: Vec<(Vec<f64>, SecEval, Vec<f64>)> = vec![];
@@ -1849,7 +2079,7 @@ fn load_levels_cap(
                         eprintln!("   cand family {} x{} -> {}", family, f, got.as_ref().map(|c| format!("gmax {:.5}", gmax_of(&c.0))).unwrap_or("none".into()));
                     }
                     if let Some(c) = got {
-                        if gmax_of(&c.0) > 0.025 || stagnant(&yk, &c.0) {
+                        if gmax_of(&c.0) > 0.025 || stagnant(&yk, &c.0) || one_layer(&yk, &c.0) || split(&c.0) || work_negative(sys, &most, &c.0, &c.2) {
                             continue; // one layer run away: not the shared branch
                         }
                         cands.push(c);
@@ -1895,20 +2125,52 @@ fn load_levels_cap(
             // the drop gets nowhere, curvature control is tried too, so neighbouring ratios do
             // not end at different loads depending on which side of the yield strain they
             // stalled (a 600 x 600 column: 622-662 kN stops against 694-713 kN peaks).
-            let modes: &[bool] = if yielded_now {
-                &[true]
+            // Shear-only runs (no moment growing with the load) have no curvature to drive. Their
+            // counterpart: the shear strains of all the working web layers are driven forward
+            // together and the capacity is the peak of the shear along that path. Following one
+            // layer's strain down the falling branch, as before, found a peak that depended on the
+            // orientation and the mesh (column: 728 kN, with 737-741 kN at M/V 0.04 m beside it).
+            // SR_NO_SHEAR_DRIVE=1 turns it off.
+            let sd_limit = std::env::var("SR_SD_A").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(50.0);
+            let shear_only = sys.lo.dm.abs() <= sd_limit && sys.lo.m0 == 0.0 && sys.lo.dv.abs() > 0.0 && std::env::var("SR_NO_SHEAR_DRIVE").is_err();
+            // The fallbacks, in order. (driven, by shear strain): the whole section driven by its
+            // curvature (bending runs) or by the shear strains of all its working web layers; the
+            // last, not driven, follows the one layer that is changing fastest. A driven mode that
+            // ends without proof of failure hands its last state to the next driven mode, so a
+            // bending run whose web fails (the curvature then has to fall back, which curvature
+            // control does not follow) is carried past its peak by the shear strains instead.
+            // SR_ONE_DRIVE=1: no hand-over to shear-strain control in bending runs.
+            let one = std::env::var("SR_ONE_DRIVE").is_ok();
+            let modes: &[(bool, bool)] = if shear_only {
+                &[(true, true), (false, false)]
+            } else if yielded_now {
+                if one || sys.lo.dm.abs() <= 50.0 { &[(true, false)] } else { &[(true, false), (true, true)] }
             } else if sys.lo.dm.abs() > 50.0 && std::env::var("SR_NO_CURV_RETRY").is_err() {
-                &[false, true]
+                // the whole section driven first; following one layer's strain is the fallback (it
+                // can run down a localized falling branch: column, M/V 0.056 m, 690.6 kN between
+                // 735.7 at 0.03 m and 715.6 at 0.08 m)
+                if one { &[(true, false), (false, false)] } else { &[(true, false), (true, true), (false, false)] }
             } else {
-                &[false]
+                &[(false, false)]
             };
-            for &yielded in modes {
+            let mut vmax_run = v_before;
+            for (mi, &(yielded, shear_drive)) in modes.iter().enumerate() {
+                let next_driven = modes.get(mi + 1).map(|x| x.0).unwrap_or(false);
                 let (mut yd, mut td, mut qd) = (yk.clone(), tk.clone(), q.clone());
                 let mut pts: Vec<SectionState> = vec![];
                 let mut dd = 0.02;
                 let mut back = false;
-                let mut vmax_f = v_before;
+                let mut vmax_f = vmax_run;
                 let mut curv_end: Option<&str> = None;
+                // Curvature control only: when the steps have shrunk to nothing, a few larger ones
+                // are tried before giving up. Where a layer crosses its cracking dip the path can
+                // snap back over a narrow band of curvature with no balanced state in it, however
+                // small the step (the corrector settles with the moment out of balance); the
+                // states beyond the band are found by stepping over it (column, M/V 0.222 m: one
+                // orientation stopped at 677 kN and 4.74 rad/km, the other had stepped from 4.31
+                // to 4.63 to 5.05 and went on to 691). SR_NO_HOP=1 turns it off.
+                const HOPS: [f64; 6] = [0.04, 0.08, 0.16, 0.32, 0.64, 1.28];
+                let mut hop: Option<usize> = None;
                 for _ in 0..(if yielded { 400 } else { 120 }) {
                     let mut j = 2;
                     for k in 2..2 + 2 * nl {
@@ -1920,50 +2182,158 @@ fn load_levels_cap(
                         j = 1;
                     }
                     let mut w = vec![0.0; nu];
-                    w[j] = 1.0;
-                    // under curvature control the bending only grows: the curvature is driven the
-                    // way it already points, even when the last load-controlled steps were
-                    // turning back along the path (shear strain falling as the load rose)
-                    let tgt = if yielded && phi_now != 0.0 && std::env::var("SR_CURV_TANGENT_SIGN").is_err() {
-                        dd * phi_now.signum()
-                    } else if td[j] < 0.0 {
-                        -dd
+                    let (tgt, pred): (f64, Vec<f64>) = if yielded && shear_drive {
+                        let top = yd[2..2 + nl].iter().fold(0.0f64, |a, b| a.max(b.abs()));
+                        let mut cnt = 0.0;
+                        for k in 2..2 + nl {
+                            if yd[k].abs() > 0.1 * top {
+                                w[k] = yd[k].signum();
+                                cnt += 1.0;
+                            }
+                        }
+                        let nrm = f64::sqrt(cnt).max(1.0);
+                        w.iter_mut().for_each(|x| *x /= nrm);
+                        let s: f64 = w.iter().zip(&td).map(|(a, b)| a * b).sum();
+                        let p: Vec<f64> = if s > 0.05 {
+                            yd.iter().zip(&td).map(|(y, t)| y + dd / s * t).collect()
+                        } else {
+                            yd.iter().zip(&w).map(|(y, x)| y + dd * x).collect()
+                        };
+                        (dd, p)
                     } else {
-                        dd
-                    };
-                    let pred: Vec<f64> = if td[j].abs() > 0.05 {
-                        yd.iter().zip(&td).map(|(y, t)| y + tgt / td[j] * t).collect()
-                    } else {
-                        let mut p = yd.clone();
-                        p[j] += tgt;
-                        p
+                        w[j] = 1.0;
+                        // under curvature control the bending only grows: the curvature is driven
+                        // the way it already points, even when the last load-controlled steps were
+                        // turning back along the path (shear strain falling as the load rose)
+                        // (the sense of the growing moment, not of the curvature the section has now: a
+                        // prestressed section is still cambered the other way when its web cracks, and
+                        // driving that camber further unloads it - T-beam, M/V 0.135-0.165 m, 398-414 kN
+                        // "peaks" between 441 kN either side. SR_CURV_OWN_SIGN=1: the earlier rule.)
+                        let phi_dir = if sys.lo.dm.abs() > 0.0 && std::env::var("SR_CURV_OWN_SIGN").is_err() { sys.lo.dm.signum() } else { phi_now.signum() };
+                        let tgt = if yielded && phi_dir != 0.0 && std::env::var("SR_CURV_TANGENT_SIGN").is_err() {
+                            dd * phi_dir
+                        } else if td[j] < 0.0 {
+                            -dd
+                        } else {
+                            dd
+                        };
+                        let pred: Vec<f64> = if td[j].abs() > 0.05 {
+                            yd.iter().zip(&td).map(|(y, t)| y + tgt / td[j] * t).collect()
+                        } else {
+                            let mut p = yd.clone();
+                            p[j] += tgt;
+                            p
+                        };
+                        (tgt, pred)
                     };
                     // distance along the path first (it can turn back through a snap-back), the
                     // crack's own strain second
                     let arc_pred: Vec<f64> = yd.iter().zip(&td).map(|(y, t)| y + dd * t).collect();
                     let got = if yielded {
                         REL_TOL.with(|c| c.set(true));
-                        let g = solve_with_flow(sys, &yd, &w, tgt, &pred, &qd).or_else(|| solve_with_flow(sys, &yd, &td, dd, &arc_pred, &qd));
+                        // a driven step goes forward: the fall-back along the path is taken only if
+                        // the driven quantity (curvature, or the web's shear strains) grew with it
+                        let fwd = |c: &(Vec<f64>, SecEval, Vec<f64>)| -> bool {
+                            if std::env::var("SR_DRIVE_ANY_WAY").is_ok() {
+                                return true;
+                            }
+                            let adv: f64 = w.iter().zip(&c.0).zip(&yd).map(|((a, b), y0)| a * (b - y0)).sum();
+                            adv * tgt > 0.0
+                        };
+                        let g = solve_with_flow(sys, &yd, &w, tgt, &pred, &qd).or_else(|| solve_with_flow(sys, &yd, &td, dd, &arc_pred, &qd).filter(fwd));
                         REL_TOL.with(|c| c.set(false));
                         g
                     } else {
                         solve_with_flow(sys, &yd, &td, dd, &arc_pred, &qd).or_else(|| solve_with_flow(sys, &yd, &w, tgt, &pred, &qd))
                     };
+                    // Stepping over web cracking. With the web barely deformed (largest shear strain
+                    // under 2 mm/m) the balanced states beyond the stall are those of a web cracked
+                    // right through, its stirrups working: several times the shear strain, at a load
+                    // that may be a third higher (prestressed T-beam, pure shear: 274 kN at 1.3 mm/m,
+                    // then 367 kN at 4.1 mm/m). The scaled-up last step is a poor start for that -
+                    // which of the six step sizes landed, if any, decided whether a ratio got through
+                    // (M/V 0: 379 kN; -0.045 m: stopped at 250). So the guesses made for it are used:
+                    // the whole web cracking together, or the fastest layers, each layer's stirrup
+                    // strain following its shear strain, with the shear shares of the guessed state
+                    // and the step taken as far as the guess goes. SR_NO_CRACK_HOP=1 turns it off.
+                    let got = if got.is_none() && hop == Some(0) && yielded && web_idle_y(sys, &yd) && std::env::var("SR_NO_CRACK_HOP").is_err() {
+                        let tmax = td.iter().skip(2).take(2 * nl).fold(0.0f64, |a, b| a.max(b.abs())).max(1e-12);
+                        let mut out = None;
+                        REL_TOL.with(|c| c.set(true));
+                        'guess: for family in [6usize, 4, 5] {
+                            for f in [1.5f64, 2.5, 4.0, 7.0] {
+                                let y0 = jump_guess(sys, &yd, &td, tmax, family, f);
+                                let adv: f64 = w.iter().zip(&y0).zip(&yd).map(|((a, b), c)| a * (b - c)).sum();
+                                if adv * tgt <= 0.0 {
+                                    continue;
+                                }
+                                let (ec, phi, g, ez, p) = sys.unpack(&y0);
+                                let q0 = flow_shape(m, sys.sz, ec, phi, &g, &ez, sys.lo.at(p).0).unwrap_or_else(|| qd.clone());
+                                FORCE_BACKOFF.with(|c| c.set(true));
+                                let c = solve_with_flow(sys, &yd, &w, adv, &y0, &q0);
+                                FORCE_BACKOFF.with(|c| c.set(false));
+                                if std::env::var("SR_CAND").is_ok() {
+                                    eprintln!("   crack hop family {} x{} -> {}", family, f, c.as_ref().map(|c| format!("gmax {:.5}", gmax_of(&c.0))).unwrap_or("none".into()));
+                                }
+                                if let Some(c) = c.filter(|c| gmax_of(&c.0) <= 0.025 && !split(&c.0)) {
+                                    CRACK_HOPPED.with(|c| c.set(true));
+                                    out = Some(c);
+                                    break 'guess;
+                                }
+                            }
+                        }
+                        REL_TOL.with(|c| c.set(false));
+                        out
+                    } else {
+                        got
+                    };
                     match got {
+                        // A driven step that loses more than 2 % of the load at once has probably stepped
+                        // over the top of the curve onto another, falling branch (the step grows by 30 %
+                        // after every success: T-beam, M/V 0.03 m, rising 359 -> 378.8 kN, then one step
+                        // to 354 kN, and 378.8 was taken as the peak with 411 kN at the next ratio). It
+                        // is taken again at half the size, down to the starting size.
+                        // SR_NO_DROP_CHECK=1 turns it off.
+                        // (a state with an untied layer split open is not taken: as a failed step)
+                        Some((y, _, _)) if split(&y) => {
+                            if std::env::var("SR_PATH").is_ok() {
+                                eprintln!("   drop: step dd {:.4} gave an untied layer split open: refused", dd);
+                            }
+                            if let Some(k) = hop {
+                                if k + 1 >= HOPS.len() {
+                                    break;
+                                }
+                                hop = Some(k + 1);
+                                dd = HOPS[k + 1];
+                                continue;
+                            }
+                            dd *= 0.5;
+                            if dd < 1e-3 {
+                                break;
+                            }
+                        }
+                        Some((y, _, _)) if yielded && hop.is_none() && dd > 0.02 && y[iv] < 0.98 * yd[iv] && std::env::var("SR_NO_DROP_CHECK").is_err() => {
+                            if std::env::var("SR_PATH").is_ok() {
+                                eprintln!("   drop: step dd {:.4} lost {:.1} % of the load: halved", dd, 100.0 * (1.0 - y[iv] / yd[iv]));
+                            }
+                            dd *= 0.5;
+                        }
                         Some((y, ev, qn)) => {
+                            hop = None;
                             let dy: Vec<f64> = y.iter().zip(&yd).map(|(a, b)| a - b).collect();
                             let n = norm2(&dy).max(1e-300);
                             td = dy.iter().map(|d| d / n).collect();
                             let st = state_of(sys, &y, &ev, n_kn);
                             if std::env::var("SR_PATH").is_ok() {
                                 let bmax = ev.bar_e.iter().fold(0.0f64, |a, b| a.max(*b));
-                                eprintln!("   drop: V {:.2} kN M {:.1} phi {:.2} rad/km bar {:.2} mm/m gmax {:.5} dd {:.4} (unknown {})", st.v, st.m, st.phi, bmax * 1e3, gmax_of(&y), dd, j);
+                                eprintln!("   drop: V {:.2} kN M {:.1} phi {:.2} rad/km bar {:.2} mm/m gmax {:.5} dd {:.4} (unknown {}) gsum {:.5}", st.v, st.m, st.phi, bmax * 1e3, gmax_of(&y), dd, j, gsum_of(&y));
                             }
                             let broken = m.bars.iter().zip(&ev.bar_e).any(|(b, e)| e.abs() >= b.steel.eu())
                                 || gmax_of(&y) > 0.025
                                 || st.layers.iter().any(|l| l.ex < -0.012);
                             yd = y;
                             qd = qn;
+                            note_peak(&yd, &qd);
                             pts.push(st);
                             if broken {
                                 curv_end = Some(if gmax_of(&yd) > 0.025 {
@@ -1979,8 +2349,20 @@ fn load_levels_cap(
                             if yielded {
                                 // stay on curvature control past the plateau until the shear has
                                 // clearly passed its peak
-                                if yd[iv] < 0.85 * vmax_f {
-                                    curv_end = Some("Peak passed under curvature control (the shear fell while the bending kept growing).");
+                                // (not while the web is not working yet - no stirrup at yield, under 5 mm/m: the
+                                // load drops as a web cracks and comes back as its stirrups take over, and a
+                                // run ended in that drop gave 1977 kN where its neighbour, through cracking,
+                                // carried 2170: 600 x 750 column under 14 400 and 14 600 kN. Driving the strain
+                                // on ends that state by itself. SR_PEAK_WHILE_IDLE=1: the earlier rule.)
+                                // (Nor before the web has had the chance to work as a whole: with the middle
+                                // cracked and its ties yielded and the outer web not yet, the load was 15 %
+                                // down at 5.9 mm/m; the whole web working, at 12-18 mm/m, carries more than
+                                // the cracking load. So the run goes on to 12 mm/m unless half the load is
+                                // lost.)
+                                let mobilising = web_idle_y(sys, &yd) || (gmax_of(&yd) < 0.012 && yd[iv] > 0.5 * vmax_f);
+                                let idle = shear_drive && mobilising && std::env::var("SR_PEAK_WHILE_IDLE").is_err();
+                                if yd[iv] < 0.85 * vmax_f && !idle {
+                                    curv_end = Some(if shear_drive { "Peak passed under shear-strain control (the shear fell while the web kept deforming)." } else { "Peak passed under curvature control (the shear fell while the bending kept growing)." });
                                     break;
                                 }
                                 dd = (dd * 1.3).min(0.5);
@@ -1996,8 +2378,21 @@ fn load_levels_cap(
                             if std::env::var("SR_PATH").is_ok() {
                                 eprintln!("   drop: step dd {:.4} failed", dd);
                             }
+                            if let Some(k) = hop {
+                                if k + 1 >= HOPS.len() {
+                                    break;
+                                }
+                                hop = Some(k + 1);
+                                dd = HOPS[k + 1];
+                                continue;
+                            }
                             dd *= 0.5;
                             if dd < 1e-3 {
+                                if yielded && std::env::var("SR_NO_HOP").is_err() {
+                                    hop = Some(0);
+                                    dd = HOPS[0];
+                                    continue;
+                                }
                                 break;
                             }
                         }
@@ -2012,15 +2407,27 @@ fn load_levels_cap(
                     // a peak already passed: the shear fell steadily (3 or more states in a row,
                     // 0.5 % or more below the top) while the curvature kept growing
                     let falling = pts.windows(2).rev().take_while(|w| w[1].v < w[0].v).count();
-                    let passed = falling >= 3
-                        && yd[iv] < 0.995 * vmax_f
+                    // (not while a tension bar is on its yield plateau: the shear sags a little along
+                    // the plateau and rises again when the bars harden - column, M/V 0.70 m: 478.5 kN at
+                    // yield, 472 along the plateau, 489.8 with hardening)
+                    let on_plateau = pts.last().map(|p| {
+                        p.bars.iter().zip(&m.bars).any(|(b, mb)| match mb.steel {
+                            SteelProps::Rebar { fy, es, esh, .. } => b.1 > fy / es && b.1 < esh,
+                            _ => false,
+                        })
+                    }).unwrap_or(false);
+                    // (or 3 % below the top, however the last steps went: a fall that large with the
+                    // driven quantity still growing is a passed peak too)
+                    let passed = ((falling >= 3 && yd[iv] < 0.995 * vmax_f) || yd[iv] < 0.97 * vmax_f)
+                        && !on_plateau
                         && std::env::var("SR_NO_SOFT_PEAK").is_err();
                     res.points.extend(pts);
                     peak_state = res.points.last().cloned();
                     res.rescued += 1;
                     if curv_end.is_none() && passed {
-                        curv_end = Some("Peak passed under curvature control (the shear fell while the bending kept growing).");
+                        curv_end = Some(if shear_drive { "Peak passed under shear-strain control (the shear fell while the web kept deforming)." } else { "Peak passed under curvature control (the shear fell while the bending kept growing)." });
                     }
+                    let mut handoff = false;
                     match curv_end {
                         Some(t) => {
                             res.reason = t.into();
@@ -2036,20 +2443,54 @@ fn load_levels_cap(
                                         eprintln!("   layer {} at z {:.0} carries {:.2} MPa, at most {:.2}: real failure", i, m.layers[i].z, tau, top);
                                     }
                                     res.reason = format!(
-                                        "Shear capacity of the concrete at z = {:.0} mm reached{} past the bars' yield.",
+                                        "Shear capacity of the concrete at z = {:.0} mm reached{}{}.",
                                         m.layers[i].z,
-                                        if m.layers[i].rho_z > 0.0 { "" } else { " (outside the stirrups)" }
+                                        if m.layers[i].rho_z > 0.0 { "" } else { " (outside the stirrups)" },
+                                        if shear_drive { "" } else { " past the bars' yield" }
                                     );
                                     res.confirmed = true;
                                 }
                                 None => {
-                                    res.reason = "Curvature control past yield could not be continued (solver stop).".into();
-                                    res.confirmed = false;
+                                    if next_driven {
+                                        handoff = true;
+                                    } else {
+                                        res.reason = if shear_drive { "Shear-strain control could not be continued (solver stop)." } else { "Curvature control past yield could not be continued (solver stop)." }.into();
+                                        res.confirmed = false;
+                                    }
                                 }
                             }
                         }
                     }
+                    if handoff {
+                        if std::env::var("SR_PATH").is_ok() {
+                            eprintln!("   no proof of failure yet: handing over to shear-strain control");
+                        }
+                        yk = yd;
+                        tk = td;
+                        q = qd;
+                        vmax_run = vmax_f;
+                        continue;
+                    }
                     break 'levels;
+                }
+                // The falling branch ran into a failure limit (25 mm/m of shear strain, crushing or a
+                // fractured bar) without the load coming back: the section has failed, and the
+                // capacity is the peak it reached on the way up. Reloading from that state, as was done
+                // before, retraces the falling branch backwards (the deformation shrinking as the load
+                // rises) onto slightly different peaks each cycle - a column in pure shear: 728 kN,
+                // then 734 and 752 kN, or 734 again, depending on the orientation.
+                // SR_RELOAD_BROKEN=1 gives the old behaviour.
+                if !yielded && !back && !pts.is_empty() && std::env::var("SR_RELOAD_BROKEN").is_err() {
+                    if let Some(t) = curv_end {
+                        if std::env::var("SR_PATH").is_ok() {
+                            eprintln!("   the falling branch ended at a failure limit: {}", t);
+                        }
+                        res.points.extend(pts);
+                        peak_state = res.points.last().cloned();
+                        res.reason = t.into();
+                        res.confirmed = true;
+                        break 'levels;
+                    }
                 }
                 // even when the load hasn't come back yet, carry on from the most cracked state the
                 // drop reached: load control and its jumps start afresh from there
@@ -2094,6 +2535,11 @@ fn load_levels_cap(
                 tk = dy.iter().map(|d| d / n).collect();
                 yk = y;
                 q = qn;
+                note_peak(&yk, &q);
+                let gb = weighted_shear_strain(sys, &yk, &q);
+                if most.as_ref().map(|r| gb > r.1).unwrap_or(true) {
+                    most = Some((yk.clone(), gb));
+                }
                 let fractured = m.bars.iter().zip(&ev.bar_e).any(|(b, e)| e.abs() >= b.steel.eu())
                     || st.layers.iter().zip(&m.layers).any(|(l, ml)| {
                         ml.rho_z > 0.0 && m.stirrup.as_ref().map(|s| l.ez >= s.0.eu()).unwrap_or(false)
@@ -2138,63 +2584,315 @@ fn load_levels_cap(
         let prev = if n >= 2 { Some(&res.points[base]) } else { None };
         let mut web = false;
         let mut crush = false;
-        if let Some(p) = prev {
+        // axial compression doing more work than the moment (a column near its axial capacity,
+        // with or without shear): the concrete fails in compression, and bending has no part
+        let mut axial_c = false;
+        let mut axial_t = false;
+        // Whether the struts crushed is read at the end of the run, some 3 % down from the peak.
+        // Earlier states do not separate web shear from web crushing: the ties yield first and
+        // the load is nearly level from a tie strain of 2 to 10 mm/m, so the state with the
+        // largest load falls anywhere along that stretch (struts at 0.44 to 1.00 of their
+        // limit), and the first state under 99.5 % of the peak is no steadier (0.46 to 1.00 on
+        // one column from one level of N to the next); both were tried and made the labels
+        // alternate on four sections of five where the end of the run does not.
+        // SR_CRUSH_AT=peak or drop reads those states.
+        let vpk = res.points.get(ipk).map(|s| s.v).unwrap_or(0.0);
+        let idesc = (ipk..n).find(|&i| res.points[i].v < 0.995 * vpk).unwrap_or(n.saturating_sub(1));
+        let gov = match std::env::var("SR_CRUSH_AT").ok().as_deref() {
+            Some("peak") => res.points.get(ipk).unwrap_or(&pk),
+            Some("drop") => res.points.get(idesc).unwrap_or(&pk),
+            _ => &pk,
+        };
+        // the direction of the compression is read at the peak load (it turns slowly along the
+        // level stretch, and the states past the peak are the most disturbed)
+        let top = res.points.get(ipk).unwrap_or(&pk);
+        let inclined = |l: &LayerState| {
+            let t = l.theta.to_degrees().abs();
+            t > 10.0 && t < 80.0
+        };
+        let at_limit = |l: &LayerState| l.f2 > 0.0 && l.f2 >= 0.85 * m.conc.peak(l.e1);
+        // Which came first, a strut at its limit or a tie at yield: "web crushing" is kept for a
+        // web whose struts crush with no tie at yield yet (the web has more ties than its
+        // concrete can use). With the ties yielding first the capacity is theirs - web shear -
+        // and the struts crushing afterwards, as the web goes on deforming, is what ends the
+        // level stretch, not what set its height. Read over the whole run, so it does not
+        // depend on which state is taken for the peak. SR_CRUSH_BY_END=1 restores the reading
+        // of the struts at the end of the run alone.
+        let ey_tie = m.stirrup.as_ref().map(|(s, _)| 0.98 * s.fy() / s.modulus());
+        let tie_yielded = |s: &SectionState| ey_tie.map(|ey| s.layers.iter().zip(&m.layers).any(|(l, ml)| ml.rho_z > 0.0 && l.ez >= ey)).unwrap_or(false);
+        let i_crush = res.points.iter().position(|s| s.layers.iter().any(|l| inclined(l) && at_limit(l)));
+        let i_yield = res.points.iter().position(|s| tie_yielded(s));
+        let by_order = std::env::var("SR_CRUSH_BY_END").is_err();
+        let struts_first = match (i_crush, i_yield) {
+            (Some(c), Some(y)) => c < y,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        // the angle of the compression from the member axis where the shear is carried: the
+        // layers' angles weighted by their shear forces (0 with no shear at all)
+        let shear_angle = |s: &SectionState| -> f64 {
+            let (mut a, mut w) = (0.0, 0.0);
+            for (l, ml) in s.layers.iter().zip(&m.layers) {
+                let t = l.theta.to_degrees().abs();
+                let f = l.v.abs() * ml.b * ml.t;
+                a += t.min((180.0 - t).abs()) * f;
+                w += f;
+            }
+            if w > 0.0 { a / w } else { 0.0 }
+        };
+        // The work from a state `p` to the end of the run: by the shear, the moment, the axial load.
+        // (slivers of layers are left out of the shear's work as they are out of the largest
+        // shear strain above: one edge layer of the circle with an undetermined strain made the
+        // "shear work" of a run at M/V 1.14 m 5.8 MN against 10.8 kN for the bending, and 15.6
+        // kN in the same run solved in the other orientation. SR_ALL_LAYERS_GMAX=1 counts all.)
+        let works = |p: &SectionState| -> (f64, f64, f64) {
             let w_shear: f64 = pk
                 .layers
                 .iter()
                 .zip(&p.layers)
                 .zip(&m.layers)
-                .map(|((a, b), l)| 0.5 * (a.v.abs() + b.v.abs()) * (a.gamma - b.gamma).abs() * l.b * l.t)
+                .zip(&counts)
+                .filter(|(_, c)| **c)
+                .map(|(((a, b), l), _)| 0.5 * (a.v.abs() + b.v.abs()) * (a.gamma - b.gamma).abs() * l.b * l.t)
                 .sum();
-            let w_bend = 0.5 * (pk.m.abs() + p.m.abs()) * (pk.phi - p.phi).abs()
-                + 0.5 * (pk.n.abs() + p.n.abs()) * 1000.0 * (pk.ec - p.ec).abs();
+            let w_m = 0.5 * (pk.m.abs() + p.m.abs()) * (pk.phi - p.phi).abs();
+            let w_n = 0.5 * (pk.n.abs() + p.n.abs()) * 1000.0 * (pk.ec - p.ec).abs();
+            (w_shear, w_m, w_n)
+        };
+        // From the state before the peak, as the comparison was first made (the solver's own
+        // test of whether the web governed a stop still goes by it).
+        let web_steps = prev.map(|p| { let (s, b, a) = works(p); s > b + a });
+        // For the label the comparison starts where the load first reached 90 % of its peak.
+        // The state before the peak is one solver step from it, and the run ends anywhere from
+        // one step to hundreds of steps after it (circle, six neighbouring ratios: 1, 1, 4, 29,
+        // 370 and 3 steps), so the two works were now a few N apart, now thousands, and close to
+        // the bending capacity one small step with a jump of shear strain in the wide-cracked
+        // tension side outweighed the bending (column 600, M/V 12.3 m, M = 484.6 of 483 kNm, V =
+        // 39 kN: shear 75 N, moment 60 N - "web shear"). A window set by the load takes in the
+        // whole stretch over which the last tenth of the capacity was reached.
+        // SR_WORK_LAST_STEPS=1 restores the short window.
+        let i90 = if vpk > 0.0 && std::env::var("SR_WORK_LAST_STEPS").is_err() {
+            (0..=ipk).find(|&i| res.points[i].v >= 0.9 * vpk).unwrap_or(base).min(base)
+        } else {
+            base
+        };
+        let base = i90;
+        if let Some(p) = if n >= 2 { res.points.get(i90) } else { None } {
+            let (w_shear, w_m, w_n) = works(p);
+            let w_bend = w_m + w_n;
             web = w_shear > w_bend;
-            let inclined = |l: &LayerState| {
-                let t = l.theta.to_degrees().abs();
-                t > 10.0 && t < 80.0
-            };
+            if w_n > w_m && std::env::var("SR_NO_AXIAL_LABEL").is_err() {
+                axial_c = pk.n + p.n < 0.0;
+                axial_t = pk.n + p.n > 0.0;
+            }
             if std::env::var("SR_MECH").is_ok() {
+                let ratio = |s: &SectionState| s.layers.iter().map(|l| l.f2 / m.conc.peak(l.e1).max(1e-9)).fold(0.0, f64::max);
                 eprintln!(
-                    "   mech: shear work {:.1} N, bending work {:.1} N (states {} -> {} of {}), struts at their limit: {}",
+                    "   mech: shear work {:.1} N, moment work {:.1} N, axial work {:.1} N (states {} -> {} of {}); largest f2 / limit {:.3} in the state read (drop-off is state {}), {:.3} at the end; angle of the compression where the shear is {:.1} deg at the peak; largest tie strain {:.2} mm/m in the state read; first strut at its limit in state {:?}, first tie at yield in state {:?}, largest load in state {}",
                     w_shear,
-                    w_bend,
+                    w_m,
+                    w_n,
                     base,
                     n - 1,
                     n,
-                    pk.layers.iter().filter(|l| inclined(l) && l.f2 >= 0.85 * m.conc.peak(l.e1)).count()
+                    ratio(gov),
+                    idesc,
+                    ratio(&pk),
+                    shear_angle(top),
+                    gov.layers.iter().zip(&m.layers).filter(|(_, ml)| ml.rho_z > 0.0).map(|(l, _)| l.ez).fold(0.0, f64::max) * 1e3,
+                    i_crush,
+                    i_yield,
+                    ipk
                 );
             }
             if web {
-                crush = pk.layers.iter().any(|l| inclined(l) && l.f2 >= 0.85 * m.conc.peak(l.e1));
+                crush = if by_order { struts_first } else { gov.layers.iter().any(|l| inclined(l) && at_limit(l)) };
             }
         }
-        let mech = if web {
-            if crush { Mechanism::WebCrushing } else { Mechanism::WebShear }
-        } else {
-            let mut yielded = false;
-            let mut hard = false;
-            for (b, mb) in pk.bars.iter().zip(&m.bars) {
-                if let SteelProps::Rebar { fy, es, esh, .. } = mb.steel {
-                    yielded |= b.1 > 0.98 * fy / es;
-                    hard |= b.1 > esh;
-                }
+        // the bars as they were at the peak load (the end of a run that went on past its peak
+        // has them further along: yielded bars read as strain-hardening)
+        let at_peak = res.points.get(ipk).unwrap_or(&pk);
+        let mut yielded = false;
+        let mut hard = false;
+        for (b, mb) in at_peak.bars.iter().zip(&m.bars) {
+            if let SteelProps::Rebar { fy, es, esh, .. } = mb.steel {
+                yielded |= b.1 > 0.98 * fy / es;
+                hard |= b.1 > esh;
+            } else if axial_t {
+                yielded |= b.2 > 0.95 * mb.steel.fy();
             }
-            if hard {
-                Mechanism::LongHardening
-            } else if yielded {
-                Mechanism::LongYield
+        }
+        let mech = if axial_c {
+            // Compression with shear and no bending to speak of. With a layer at its compressive
+            // limit at the peak the concrete crushed: a diagonal strut at moderate compression,
+            // the axial compression itself near the axial capacity. The split of the work between
+            // shear and shortening does not tell the two apart - it jumps from one level of N to
+            // the next with how far past the peak the run went - but the compression where the
+            // shear is carried turns steadily towards the axis, and under 10 deg it is no strut.
+            let crushed = gov.layers.iter().any(|l| at_limit(l));
+            let strut = { let t = shear_angle(top); t > 10.0 && t < 80.0 };
+            if crushed || (!web && pk.layers.iter().any(|l| at_limit(l))) {
+                if !strut { Mechanism::Crushing } else if !by_order || struts_first { Mechanism::WebCrushing } else { Mechanism::WebShear }
+            } else if web {
+                Mechanism::WebShear
             } else {
-                Mechanism::Flexure
+                Mechanism::Crushing
             }
+        } else if web {
+            if crush { Mechanism::WebCrushing } else { Mechanism::WebShear }
+        } else if hard {
+            Mechanism::LongHardening
+        } else if yielded {
+            Mechanism::LongYield
+        } else if axial_t {
+            // tension with no bar at yield: the peak is the cracking load
+            Mechanism::Unclear
+        } else {
+            Mechanism::Flexure
         };
         res.mech = Some(mech);
+        res.web_work = Some(web_steps.unwrap_or(web));
     }
     (res, yk, q, reached)
 }
 
 /// Trace the equilibrium path at moment/shear ratio `a` (m) up to and past the peak of V.
 pub fn shear_path(m: &SModel, n_kn: f64, a: f64, mphi: &MPhiResult) -> ShearResult {
-    shear_path_const(m, n_kn, a, 0.0, mphi)
+    let r = shear_path_const(m, n_kn, a, 0.0, mphi);
+    let hopped = CRACK_HOPPED.with(|c| c.replace(false));
+    let r = past_cracking_by_neighbour(m, n_kn, a, mphi, r);
+    if hopped || r.reason.contains("[web cracking passed") {
+        return branch_of_neighbours(m, n_kn, a, mphi, r);
+    }
+    r
+}
+
+/// A run that had to step over web cracking (or was carried over it from a neighbouring ratio)
+/// lands where the step happens to put it, which may be a lower branch than the one a ratio
+/// next to it follows without a break (prestressed T-beam: M/V 0.03 m stepped to 359 kN and
+/// peaked at 390.6 kN at -2.75 rad/km; 0.015 m, straight through cracking, 411 kN at -3.7).
+/// The ratios 15 mm to either side are run, their peak states carried back to this ratio and
+/// continued, and the highest result kept; its states are joined to the run.
+/// SR_NO_BRANCH_NEIGHBOUR=1 turns it off.
+fn branch_of_neighbours(m: &SModel, n_kn: f64, a: f64, mphi: &MPhiResult, r: ShearResult) -> ShearResult {
+    // Off by default now (SR_BRANCH_NEIGHBOUR=1 turns it on): with the one smooth rule for the
+    // shear shares the T-beam sweeps are the same with and without it, and in bending-dominated
+    // runs that end at the 25 mm/m limit it lifted single ratios by about 3 % (600 x 600 column,
+    // M/V 0.75 and 0.90 m: 482 and 435 kN in a row of 486, 467, 450, 433, 418, 402).
+    if std::env::var("SR_BRANCH_NEIGHBOUR").is_err() {
+        return r;
+    }
+    let own = take_peak_seed();
+    let v_own = r.points.iter().map(|p| p.v).fold(0.0, f64::max);
+    let mut best: Option<(f64, ShearResult, f64, Option<Seed>)> = None;
+    for da in [0.015, -0.015] {
+        let a2 = a + da;
+        if a2 < 0.0 {
+            continue;
+        }
+        let helper = shear_path_const(m, n_kn, a2, 0.0, mphi);
+        let seed = take_peak_seed();
+        if web_idle(m, &helper) {
+            continue;
+        }
+        let Some(seed) = seed else { continue };
+        let Some(r2) = shear_path_seeded(m, n_kn, a, &seed) else { continue };
+        let v2 = r2.points.iter().map(|p| p.v).fold(0.0, f64::max);
+        if std::env::var("SR_PATH").is_ok() {
+            eprintln!("   stepped over cracking ({:.1} kN): the branch of M/V {:.3} m gives {:.1} kN", v_own, a2, v2);
+        }
+        if v2 > 1.01 * best.as_ref().map(|b| b.0).unwrap_or(v_own) {
+            best = Some((v2, r2, a2, take_peak_seed()));
+        }
+    }
+    match best {
+        Some((_, r2, a2, seed)) => {
+            if let Some(s) = seed {
+                PEAK.with(|p| *p.borrow_mut() = Some((s.y[s.y.len() - 1], s.y, s.q)));
+            }
+            let mut out = r;
+            out.points.extend(r2.points);
+            out.reason = format!("{} [branch of M/V {:.3} m]", r2.reason.replace(" (continued from a neighbouring ratio's state)", ""), a2);
+            out.confirmed = r2.confirmed;
+            out.mech = r2.mech;
+            out.rescued += 1;
+            out
+        }
+        None => {
+            if let Some(s) = own {
+                PEAK.with(|p| *p.borrow_mut() = Some((s.y[s.y.len() - 1], s.y, s.q)));
+            }
+            r
+        }
+    }
+}
+
+/// The largest shear strain of any layer at the run's state of largest shear.
+fn peak_gmax(r: &ShearResult) -> f64 {
+    r.points
+        .iter()
+        .max_by(|a, b| a.v.partial_cmp(&b.v).unwrap())
+        .map(|p| p.layers.iter().fold(0.0f64, |a, l| a.max(l.gamma.abs())))
+        .unwrap_or(0.0)
+}
+
+/// A run of a section with stirrups that stopped at web cracking (its web under 2 mm/m of
+/// shear strain at the largest load) has not failed: beyond the stall lie the states of a web
+/// cracked right through, its stirrups working, which the run could not reach by any step
+/// (prestressed T-beam: 250 kN at M/V -0.045 m, with 386 kN at -0.06 m and 387 kN at -0.015 m
+/// either side of it). Ratios a little to either side are run until one gets past cracking;
+/// its peak state is carried back to this ratio (`shear_path_seeded`) and the run goes on from
+/// there. The states are joined to the run, so its record shows the stall and then the cracked
+/// states. SR_NO_CRACK_NEIGHBOUR=1 turns it off.
+fn past_cracking_by_neighbour(m: &SModel, n_kn: f64, a: f64, mphi: &MPhiResult, r: ShearResult) -> ShearResult {
+    // (only where the web governed the stop: a bending-dominated run also ends with its web under
+    // 2 mm/m, and helper runs for those doubled the time of the sample beam's diagram)
+    let web = r.web_work.unwrap_or(matches!(r.mech, Some(Mechanism::WebShear) | Some(Mechanism::WebCrushing) | None));
+    // Also a run that simply could not be continued (a solver stop, no proof of failure) with its
+    // web far from spent - under 5 mm/m of shear strain: the stirrups have at most just yielded
+    // (T-beam, M/V 0.135-0.165 m: 398-414 kN at 2.5 mm/m, 441 kN at 0.12 and 0.18 m).
+    let unproven = (r.reason.contains("(solver stop)") || r.reason.starts_with("No balanced state")) && peak_gmax(&r) < 5e-3;
+    if std::env::var("SR_PATH").is_ok() {
+        eprintln!("   end of run: mechanism {:?}, web idle {}, unproven stop {}, largest shear strain at the peak {:.5}", r.mech, web_idle(m, &r), unproven, peak_gmax(&r));
+    }
+    if m.stirrup.is_none() || !web || r.points.len() < 3 || !(web_idle(m, &r) || unproven) || std::env::var("SR_NO_CRACK_NEIGHBOUR").is_ok() {
+        return r;
+    }
+    let own = take_peak_seed();
+    let v_own = r.points.iter().map(|p| p.v).fold(0.0, f64::max);
+    let trace = std::env::var("SR_PATH").is_ok();
+    for da in [0.015, -0.015, 0.03, -0.03, 0.06, -0.06, 0.1] {
+        let a2 = a + da;
+        if a2 < 0.0 {
+            continue;
+        }
+        let helper = shear_path_const(m, n_kn, a2, 0.0, mphi);
+        let seed = take_peak_seed();
+        let vh = helper.points.iter().map(|p| p.v).fold(0.0, f64::max);
+        if web_idle(m, &helper) || vh < 1.02 * v_own {
+            continue;
+        }
+        let Some(seed) = seed else { continue };
+        let Some(r2) = shear_path_seeded(m, n_kn, a, &seed) else { continue };
+        let v2 = r2.points.iter().map(|p| p.v).fold(0.0, f64::max);
+        if trace {
+            eprintln!("   stalled at web cracking ({:.1} kN): continued from M/V {:.3} m -> {:.1} kN", v_own, a2, v2);
+        }
+        if v2 > 1.02 * v_own {
+            let mut out = r;
+            out.points.extend(r2.points);
+            out.reason = format!("{} [web cracking passed from M/V {:.3} m]", r2.reason.replace(" (continued from a neighbouring ratio's state)", ""), a2);
+            out.confirmed = r2.confirmed;
+            out.mech = r2.mech;
+            out.rescued += 1;
+            return out;
+        }
+    }
+    // no neighbour helped: the run's own peak state stays the one to continue from
+    if let Some(s) = own {
+        PEAK.with(|p| *p.borrow_mut() = Some((s.y[s.y.len() - 1], s.y, s.q)));
+    }
+    r
 }
 
 /// As `shear_path`, with a constant moment `m0_kn` (kNm, analysis frame) applied first and held.
@@ -2209,10 +2907,12 @@ pub fn shear_path_const(m: &SModel, n_kn: f64, a: f64, m0_kn: f64, mphi: &MPhiRe
 /// constant loads only.
 pub fn sectional_path(m: &SModel, cst: (f64, f64, f64), inc: (f64, f64, f64), _mphi: &MPhiResult) -> ShearResult {
     let ratio = if inc.2.abs() > 1e-12 { inc.1 / inc.2 } else { 1000.0 };
-    let mut res = ShearResult { mv: ratio, points: vec![], reason: String::new(), confirmed: false, rescued: 0, mech: None };
+    let mut res = ShearResult { mv: ratio, points: vec![], reason: String::new(), confirmed: false, rescued: 0, mech: None, web_work: None };
+    PEAK.with(|p| *p.borrow_mut() = None);
+    CRACK_HOPPED.with(|c| c.set(false));
     let nl = m.layers.len();
     let sz = m.stirrup.as_ref().map(|s| s.1).unwrap_or(f64::INFINITY);
-    let bw = m.layers.iter().filter(|l| l.b > 0.0).map(|l| l.b).fold(f64::MAX, f64::min);
+    let bw = scale_width(m);
     let vs = (0.25 * m.conc.fc.sqrt() * bw * 0.8 * m.h).max(1000.0); // N
     let es = 0.002;
     let mut scale = vec![1.0 / es, m.h / (2.0 * es)];
@@ -2241,8 +2941,8 @@ pub fn sectional_path(m: &SModel, cst: (f64, f64, f64), inc: (f64, f64, f64), _m
     };
     let tangent = |sys: &Sys, yk: &[f64], q: &[f64]| -> Option<Vec<f64>> {
         let nu = sys.nu();
-        let (r0, _) = sys.resid(yk, q);
-        let mut aa = sys.jac(yk, q, &r0);
+        let (r0, ev0) = sys.resid(yk, q);
+        let mut aa = sys.jac(yk, q, &r0, &ev0);
         let mut row = vec![0.0; nu];
         row[nu - 1] = 1.0;
         aa.extend_from_slice(&row);
@@ -2322,4 +3022,403 @@ pub fn sectional_path(m: &SModel, cst: (f64, f64, f64), inc: (f64, f64, f64), _m
         r.reason = format!("{} Load factor at the peak: {:.2}.", r.reason, f);
     }
     r
+}
+
+/// Scale on the corrector's acceptance band (SR_TOLK, default 1: 4 tolerances, 8 when stalled).
+fn tolk() -> f64 {
+    static K: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("SR_TOLK").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
+}
+
+/// SR_LMSTAT=1: how the corrector's calls ended, by iteration count (successes) and failures,
+/// with the section evaluations each group used.
+pub static LMSTAT: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+fn lmstat(ok: bool, it: usize, evals: u64) {
+    let k = if !ok { 5 } else if it <= 5 { 0 } else if it <= 10 { 1 } else if it <= 20 { 2 } else if it < 40 { 3 } else { 4 };
+    LMSTAT[k].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    LMSTAT[6 + k].fetch_add(evals, std::sync::atomic::Ordering::Relaxed);
+}
+pub fn lmstat_print() {
+    let b = |i: usize| BRSTAT[i].load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("   rescue at a large step: {} ok ({:.2} s), {} failed ({:.2} s); at a small step: {} ok ({:.2} s), {} failed ({:.2} s)", b(0), b(4) as f64 / 1e6, b(1), b(5) as f64 / 1e6, b(2), b(6) as f64 / 1e6, b(3), b(7) as f64 / 1e6);
+    for (k, name) in PROF_NAMES.iter().enumerate() {
+        eprintln!("   prof {:<40} {:8.2} s", name, PROF[k].load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e9);
+    }
+    let names = ["ok in <=5 its", "ok in 6-10", "ok in 11-20", "ok in 21-39", "ok at 40", "failed"];
+    for k in 0..6 {
+        let g = |i: usize| LMSTAT[i].load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("   corrector {:<14} {:>7} calls {:>8.2} s", names[k], g(k), g(6 + k) as f64 / 1e6);
+    }
+}
+
+thread_local! {
+    /// merit at each iteration of the corrector call in progress (SR_LMTRACE diagnostics)
+    static LMF: std::cell::Cell<[f64; 41]> = const { std::cell::Cell::new([0.0; 41]) };
+}
+
+/// SR_LMSTAT: the cracking rescue's calls and time: [big ok, big fail, small ok, small fail] x 2.
+pub static BRSTAT: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+thread_local! {
+    /// Set while the cracking rescue is tried at a large load step (see `correct_condensed`).
+    static QUICK_RESCUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn nm_tol() -> f64 {
+    static K: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("SR_NM_TOL").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0))
+}
+
+/// A balanced state to restart from: the unknowns (scaled) and the shear shares, for one mesh.
+#[derive(Clone, Debug)]
+pub struct Seed {
+    pub y: Vec<f64>,
+    pub q: Vec<f64>,
+    pub layers: usize,
+}
+
+thread_local! {
+    /// The state of largest load of the run in progress on this thread (see `take_peak_seed`).
+    static PEAK: std::cell::RefCell<Option<(f64, Vec<f64>, Vec<f64>)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn note_peak(y: &[f64], q: &[f64]) {
+    let v = y[y.len() - 1];
+    PEAK.with(|p| {
+        let mut p = p.borrow_mut();
+        if p.as_ref().map(|b| v > b.0).unwrap_or(true) {
+            *p = Some((v, y.to_vec(), q.to_vec()));
+        }
+    });
+}
+
+/// The state of largest load reached by the last path run on this thread, to continue a
+/// neighbouring ratio from (`shear_path_seeded`); clears it.
+pub fn take_peak_seed() -> Option<Seed> {
+    PEAK.with(|p| p.borrow_mut().take()).map(|(_, y, q)| Seed { layers: (y.len() - 3) / 2, y, q })
+}
+
+/// Continuation between neighbouring M/V ratios: the run at ratio `a` restarted from the peak
+/// state another ratio reached on the same mesh, re-balanced for this ratio at that load (or a
+/// little under it), and carried on from there with the usual load levels and fallbacks.
+///
+/// Why: near the top of an M-V diagram the web's layers can sit on different branches (a whole
+/// zone of layers past its cracking dip, or only a few), and which one a run from zero lands on
+/// changes from one ratio to the next: a 600 x 750 column gave 1256 kN at M/V 0.24 m and 1226 at
+/// 0.26 m, both on the same path up to 1210 kN. The state one ratio found is a few per cent of
+/// moment away from a balanced state of its neighbour, which the neighbour's own run did not
+/// find; with no unloading in the material model that state is a load the section carries.
+/// Returns None when the seed does not balance at this ratio.
+pub fn shear_path_seeded(m: &SModel, n_kn: f64, a: f64, seed: &Seed) -> Option<ShearResult> {
+    let nl = m.layers.len();
+    if seed.layers != nl || seed.y.len() != 2 * nl + 3 {
+        return None;
+    }
+    let sz = m.stirrup.as_ref().map(|s| s.1).unwrap_or(f64::INFINITY);
+    let bw = scale_width(m);
+    let vs = (0.25 * m.conc.fc.sqrt() * bw * 0.8 * m.h).max(1000.0);
+    let es = 0.002;
+    let mut scale = vec![1.0 / es, m.h / (2.0 * es)];
+    for _ in 0..2 {
+        for l in &m.layers {
+            scale.push(((l.b * l.t) / m.area).sqrt().max(1e-6) / es);
+        }
+    }
+    scale.push(1.0 / vs);
+    let mut tol = vec![1e-4 * m.conc.fc * m.area, 1e-4 * m.conc.fc * m.area * m.h];
+    tol.extend(std::iter::repeat(1e-4 * vs).take(2 * nl));
+    let lo = Lo::new((n_kn, 0.0, 0.0), (0.0, a, 1.0), m.h);
+    let sys = Sys { m, sz, lo, scale, tol };
+    let nu = sys.nu();
+    let iv = nu - 1;
+    let mut wv = vec![0.0; nu];
+    wv[iv] = 1.0;
+    PEAK.with(|p| *p.borrow_mut() = None);
+    CRACK_HOPPED.with(|c| c.set(false));
+    for f in [1.0, 0.99, 0.975, 0.95] {
+        let mut y0 = seed.y.clone();
+        y0[iv] *= f;
+        let Some((y, ev, q)) = solve_with_flow(&sys, &y0, &wv, 0.0, &y0, &seed.q) else { continue };
+        if !ev.ok {
+            continue;
+        }
+        let mut res = ShearResult { mv: a, points: vec![], reason: String::new(), confirmed: false, rescued: 0, mech: None, web_work: None };
+        res.points.push(state_of(&sys, &y, &ev, n_kn));
+        note_peak(&y, &q);
+        if std::env::var("SR_PATH").is_ok() {
+            eprintln!("   continued from a neighbour's state at {:.0} % of its load: V {:.1} kN", 100.0 * f, res.points[0].v);
+        }
+        let mut r = load_levels(&sys, res, y, wv.clone(), q, n_kn);
+        r.reason = format!("{} (continued from a neighbouring ratio's state)", r.reason);
+        return Some(r);
+    }
+    None
+}
+
+/// Whether a failed pass of the share iteration goes back to the last good pass with half the
+/// update: SR_SHARE_BACKOFF = "all" (every solve) or "rescue" (the cracking rescue only); off by
+/// default. Measured (5 sections, 20 points a side): "rescue" recovers three of six T-beam runs
+/// that stall at web cracking (M/V -0.075 m 246 -> 398 kN) but leaves its diagram with 3
+/// unconfirmed points and 1.7 x the time; "all" smooths the 600 x 750 column (largest dent 2.9 ->
+/// 1.2 %) but gives the 600 x 600 column 4 unconfirmed points and takes 1.4 x the time overall.
+fn share_backoff(rebranch: bool) -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("SR_SHARE_BACKOFF").as_deref() {
+        Ok("all") => 2,
+        Ok("rescue") => 1,
+        _ => 0,
+    });
+    mode == 2 || (mode == 1 && rebranch) || FORCE_BACKOFF.with(|c| c.get())
+}
+
+thread_local! {
+    /// Set while a cracking step-over is being solved: its share iteration backs off (see
+    /// `share_backoff`) whatever the general setting.
+    static FORCE_BACKOFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+thread_local! {
+    /// Set when the run in progress on this thread got past web cracking by a step-over
+    /// (see `branch_of_neighbours`).
+    static CRACK_HOPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The web is not working yet: no stirrup has reached yield and no layer is past 5 mm/m of shear
+/// strain. A stop there, in a section with stirrups, is a stall at web cracking and not the
+/// web's failure. (The first test was a largest shear strain under 2 mm/m; a T-beam at M/V
+/// 0.27-0.33 m stalls the same way at 3 mm/m.)
+fn web_idle_layers(m: &SModel, layers: &mut dyn Iterator<Item = (f64, f64)>) -> bool {
+    let Some((steel, _)) = &m.stirrup else { return false };
+    let ey = 0.98 * steel.fy() / steel.modulus();
+    for (i, (g, ez)) in layers.enumerate() {
+        if g.abs() >= 5e-3 || (m.layers[i].rho_z > 0.0 && ez >= ey) {
+            return false;
+        }
+    }
+    true
+}
+
+/// `web_idle_layers` at a run's state of largest shear.
+fn web_idle(m: &SModel, r: &ShearResult) -> bool {
+    match r.points.iter().max_by(|a, b| a.v.partial_cmp(&b.v).unwrap()) {
+        Some(p) => web_idle_layers(m, &mut p.layers.iter().map(|l| (l.gamma, l.ez))),
+        None => false,
+    }
+}
+
+/// `web_idle_layers` at a vector of unknowns.
+fn web_idle_y(sys: &Sys, y: &[f64]) -> bool {
+    let (_, _, g, ez, _) = sys.unpack(y);
+    web_idle_layers(sys.m, &mut g.iter().copied().zip(ez.iter().copied()))
+}
+
+/// The curvature interval of the dual section (the two sections differ by this fraction of the
+/// curvature), SR_FLOW_H.
+fn flow_h() -> f64 {
+    static H: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *H.get_or_init(|| std::env::var("SR_FLOW_H").ok().and_then(|v| v.parse().ok()).unwrap_or(0.04))
+}
+
+/// The dual section from material stiffnesses that depend on the strain plane alone, with the
+/// tangent where a material's curve bends before any yield: as `secant_changes`, but a concrete
+/// layer in compression takes the slope of its uniaxial curve (not stress over strain), and a
+/// prestressing strand the slope of its own curve. Reinforcing bars keep stress over strain
+/// (their modulus before yield; on the plateau the slope is zero and the shear flow would
+/// leave the web). Concrete in tension keeps stress over strain (Ec uncracked, the small
+/// tension-stiffening value once cracked).
+fn smooth_tangent_changes(m: &SModel, sz: f64, ec: f64, phi: f64, g: &[f64], ez: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let ecm = m.conc.ec;
+    // The slope of the uniaxial curve goes to nothing at the peak stress and below it beyond, and
+    // with every layer there (a section under very heavy compression) the shear would be spread
+    // evenly over the depth: sample beam under 6000 kN, 5.39 MPa throughout at 800 kN where the
+    // difference of two neighbouring solved sections gives 6.38 MPa at mid-depth, and 832 kN
+    // carried against the 740-785 kN that agree with equilibrium (`--check-shares`). So a layer's
+    // stiffness is never under a quarter of what its own solved state gives (longitudinal
+    // stress over strain, with the web's shear in it, see `state_changes`): where the concrete
+    // is near or past its peak that takes over, and elsewhere the slope stands.
+    // SR_TAN_FLOOR sets the quarter (0: the slope alone).
+    let ev = section_direct(m, sz, ec, phi, g, ez);
+    let e_layer: Vec<f64> = m
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let e = m.strain(ec, phi, l.z);
+            if e < -1e-7 {
+                let h = 1e-6;
+                let tangent = (m.conc.uniaxial(e + h, l.m_bond) - m.conc.uniaxial(e - h, l.m_bond)) / (2.0 * h);
+                let state = (ev.outs[i].sx / e).clamp(0.0, ecm);
+                tangent.max(tan_floor() * state).clamp(0.0, ecm)
+            } else if e.abs() <= 1e-7 {
+                ecm
+            } else {
+                (m.conc.uniaxial(e, l.m_bond) / e).clamp(0.0, ecm)
+            }
+        })
+        .collect();
+    let e_bar: Vec<f64> = m
+        .bars
+        .iter()
+        .map(|b| {
+            let e = m.strain(ec, phi, b.z) + b.pre;
+            match b.steel {
+                SteelProps::Prestress { .. } => {
+                    let h = 1e-6;
+                    ((b.steel.stress(e + h) - b.steel.stress(e - h)) / (2.0 * h)).clamp(0.0, b.steel.modulus())
+                }
+                _ => {
+                    if e.abs() < 1e-7 {
+                        b.steel.modulus()
+                    } else {
+                        (b.steel.stress(e) / e).abs().min(b.steel.modulus())
+                    }
+                }
+            }
+        })
+        .collect();
+    let (mut ea, mut eaz) = (0.0, 0.0);
+    for (l, e) in m.layers.iter().zip(&e_layer) {
+        ea += e * l.b * l.t;
+        eaz += e * l.b * l.t * (l.z - m.zc);
+    }
+    for (b, e) in m.bars.iter().zip(&e_bar) {
+        ea += e * b.area;
+        eaz += e * b.area * (b.z - m.zc);
+    }
+    let d0 = if ea > 0.0 { -eaz / ea } else { 0.0 };
+    let de = |z: f64| -(d0 + (z - m.zc));
+    let dl = m.layers.iter().zip(&e_layer).map(|(l, e)| e * de(l.z) * l.b * l.t).collect();
+    let db = m.bars.iter().zip(&e_bar).map(|(b, e)| e * de(b.z) * b.area).collect();
+    (dl, db)
+}
+
+/// The least a compressed concrete layer's stiffness may be in the dual section, as a fraction of
+/// the stiffness its own solved state gives (SR_TAN_FLOOR, default 0.25).
+fn tan_floor() -> f64 {
+    static K: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *K.get_or_init(|| std::env::var("SR_TAN_FLOOR").ok().and_then(|v| v.parse().ok()).unwrap_or(0.25))
+}
+
+/// The dual section from every layer's own solved state: a concrete layer's stiffness is its
+/// longitudinal stress over its longitudinal strain as the two-dimensional (MCFT) state gives
+/// them at the present shear and transverse strains - so a web layer that has cracked and
+/// softened under shear counts for less, and the shear flow moves away from it - times the
+/// ratio of slope to secant of the uniaxial curve at that strain (the bend of the curve before
+/// the peak), never under a quarter of the state value. Strands take the slope of their curve,
+/// reinforcing bars stress over strain. It depends on the state continuously (no slopes taken
+/// across the kinks of a layer's response, which is what made the difference of two solved
+/// sections jump from ratio to ratio).
+fn state_changes(m: &SModel, sz: f64, ec: f64, phi: f64, g: &[f64], ez: &[f64]) -> (Vec<f64>, Vec<f64>) {
+    let ecm = m.conc.ec;
+    let ev = section_direct(m, sz, ec, phi, g, ez);
+    let e_layer: Vec<f64> = m
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(i, l)| {
+            let e = m.strain(ec, phi, l.z);
+            if e.abs() <= 1e-7 {
+                return ecm;
+            }
+            let state = (ev.outs[i].sx / e).clamp(0.0, ecm);
+            if e < 0.0 {
+                let h = 1e-6;
+                let tangent = (m.conc.uniaxial(e + h, l.m_bond) - m.conc.uniaxial(e - h, l.m_bond)) / (2.0 * h);
+                let secant = m.conc.uniaxial(e, l.m_bond) / e;
+                let bend = if secant > 1e-9 { (tangent / secant).clamp(0.25, 1.0) } else { 1.0 };
+                state * bend
+            } else {
+                state
+            }
+        })
+        .collect();
+    let e_bar: Vec<f64> = m
+        .bars
+        .iter()
+        .map(|b| {
+            let e = m.strain(ec, phi, b.z) + b.pre;
+            match b.steel {
+                SteelProps::Prestress { .. } => {
+                    let h = 1e-6;
+                    ((b.steel.stress(e + h) - b.steel.stress(e - h)) / (2.0 * h)).clamp(0.0, b.steel.modulus())
+                }
+                _ => {
+                    if e.abs() < 1e-7 {
+                        b.steel.modulus()
+                    } else {
+                        (b.steel.stress(e) / e).abs().min(b.steel.modulus())
+                    }
+                }
+            }
+        })
+        .collect();
+    let (mut ea, mut eaz) = (0.0, 0.0);
+    for (l, e) in m.layers.iter().zip(&e_layer) {
+        ea += e * l.b * l.t;
+        eaz += e * l.b * l.t * (l.z - m.zc);
+    }
+    for (b, e) in m.bars.iter().zip(&e_bar) {
+        ea += e * b.area;
+        eaz += e * b.area * (b.z - m.zc);
+    }
+    let d0 = if ea > 0.0 { -eaz / ea } else { 0.0 };
+    let de = |z: f64| -(d0 + (z - m.zc));
+    let dl = m.layers.iter().zip(&e_layer).map(|(l, e)| e * de(l.z) * l.b * l.t).collect();
+    let db = m.bars.iter().zip(&e_bar).map(|(b, e)| e * de(b.z) * b.area).collect();
+    (dl, db)
+}
+
+/// The width the shear scale is taken from (load steps and tolerances are fractions of
+/// 0.25 sqrt(f'c) x this width x 0.8 h): the median width of the layers. It was the narrowest
+/// layer, which for a tapering section - the tip of a section turned for shear in two
+/// directions, the top of a circle - is a few millimetres and gets smaller as the mesh gets
+/// finer: a 450 x 750 column turned 45 degrees on 80 layers was climbing 1.4 kN a step and ran
+/// out of its 600 steps at 851 kN (1274 kN on 40 layers). A rectangle is unchanged; a T- or
+/// I-beam keeps its web. SR_SCALE_MIN_WIDTH=1: the narrowest layer.
+fn scale_width(m: &SModel) -> f64 {
+    let mut w: Vec<f64> = m.layers.iter().filter(|l| l.b > 0.0).map(|l| l.b).collect();
+    if w.is_empty() {
+        return 1.0;
+    }
+    w.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if std::env::var("SR_SCALE_MIN_WIDTH").is_ok() {
+        return w[0];
+    }
+    w[w.len() / 2]
+}
+
+/// The section's shear strain as the shear sees it: every layer's shear strain weighted by its
+/// share of the shear (the deformation the shear does work on).
+fn weighted_shear_strain(sys: &Sys, y: &[f64], q: &[f64]) -> f64 {
+    let (_, _, g, _, _) = sys.unpack(y);
+    g.iter().zip(q).map(|(a, b)| a.abs() * b).sum()
+}
+
+/// Second-order work against the most deformed state taken so far: the changes of N, M and V
+/// times the changes of the centroid strain, the curvature and the shear strain. A balanced
+/// state at a higher shear for which this is clearly negative (under -1 % of the load changes
+/// times the reference deformations) lies on a branch where more load goes with less
+/// deformation - the falling side of a softening curve, climbed backwards. A section under load
+/// control cannot stay there, and the top of such a branch is not a capacity: a 600 x 750 column
+/// under 14 600 kN jumped at 1996 kN to a state with its whole web cracked and then "carried"
+/// up to 2105 kN as the web's shear strains shrank from 0.162 to 0.140, against 1977 kN under
+/// 14 400 kN. Load-controlled steps and the rescue's candidates are refused when it is negative
+/// (steps that prescribe a deformation are not: they are stable by construction).
+/// SR_NO_WORK_CHECK=1 turns it off.
+fn work_negative(sys: &Sys, most: &Option<(Vec<f64>, f64)>, y: &[f64], q: &[f64]) -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("SR_NO_WORK_CHECK").is_ok()) {
+        return false;
+    }
+    let Some((yr, gr)) = most else { return false };
+    let (ec0, phi0, _, _, p0) = sys.unpack(yr);
+    let (ec1, phi1, _, _, p1) = sys.unpack(y);
+    let ((n0, m0, v0), (n1, m1, v1)) = (sys.lo.at(p0), sys.lo.at(p1));
+    if v1 <= v0 {
+        return false;
+    }
+    let g1 = weighted_shear_strain(sys, y, q);
+    let work = (n1 - n0) * (ec1 - ec0) + (m1 - m0) * (phi1 - phi0) + (v1 - v0) * (g1 - gr);
+    let scale = (n1 - n0).abs() * ec0.abs() + (m1 - m0).abs() * phi0.abs() + (v1 - v0).abs() * gr.abs();
+    work < -0.01 * scale
 }

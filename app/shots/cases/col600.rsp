@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no" ?>
+<!DOCTYPE suite_3g SYSTEM "r3g.dtd">
+<document>
+	<r3g_beam	date		="2026/11/26"	>
+		<concrete	fcp		="35.0"
+				maxagg	="19.0"	/>
+		<rebar		fy		="400.0"
+				esh		="7.0"
+				eu		="100.0"	/>
+		<rebar		fy		="400.0"
+				esh		="7.0"
+				eu		="100.0"
+				name		="Trans"	/>
+		<sectionSOLID		>
+					600.0	600.0
+					0.0	600.0	"Concrete 1"
+			</sectionSOLID>
+		<shapesection	name		="RECT"
+				par1		="600.0"
+				par2		="600.0"	/>
+		<longreinfx	z		="531.4"
+				type		="Steel 1"
+				num		="3"
+				A		="1500.0"
+				bartitle	="25M"
+				name		="top"	/>
+		<longreinfx	z		="300.0"
+				type		="Steel 1"
+				num		="2"
+				A		="1000.0"
+				bartitle	="25M"
+				name		="side"	/>
+		<longreinfx	z		="68.6"
+				type		="Steel 1"
+				num		="3"
+				A		="1500.0"
+				bartitle	="25M"
+				name		="bot"	/>
+		<transreinfz	A		="400.0"
+				type		="Trans"
+				pattern	="3"
+				space		="250.0"
+				disttop	="552.0"
+				distbot	="48.0"
+				bartitle	="15M"
+				name		="stirrup"	/>
+		<sectloading		/>
+	</r3g_beam>
+</document>

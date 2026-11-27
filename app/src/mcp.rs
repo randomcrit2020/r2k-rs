@@ -1301,7 +1301,8 @@ fn t_shear2d(a: &Value, pf: &(dyn Fn(f32) + Sync)) -> Result<Value, String> {
         .map(|r| {
             json!({
                 "theta_deg": f(r.theta), "v_kn": f(r.v), "vx_kn": f(r.vx()), "vy_kn": f(r.vy()), "m_knm": f(r.m),
-                "tie_area_mm2": f(r.av), "mechanism": r.mech.map(|m| m.label()), "reason": analysis::clean_reason(&r.reason)
+                "tie_area_mm2": f(r.av), "mechanism": r.mech.map(|m| m.label()), "reason": analysis::clean_reason(&r.reason),
+                "limited_by_axis_capacity": r.limited, "v_analysis_kn": f(r.v_model)
             })
         })
         .collect();

@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod analysis;
+mod bench;
 mod biaxial;
 mod shear2d;
 mod torsion;
@@ -112,7 +113,7 @@ fn main() -> eframe::Result<()> {
         let d = shear2d::diagram(&sec, n, mv, dirs, &|_| {});
         for r in &d.runs {
             println!(
-                "theta {:6.1}: V {:7.1} kN (Vx {:7.1}, Vy {:7.1}), M {:7.1} kNm, ties {:6.1} mm2, {:?}; {}",
+                "theta {:6.1}: V {:7.1} kN (Vx {:7.1}, Vy {:7.1}), M {:7.1} kNm, ties {:6.1} mm2, {:?}; {}{}",
                 r.theta,
                 r.v,
                 r.vx(),
@@ -120,7 +121,8 @@ fn main() -> eframe::Result<()> {
                 r.m,
                 r.av,
                 r.mech,
-                r.reason.chars().take(70).collect::<String>()
+                r.reason.chars().take(70).collect::<String>(),
+                r.limited.map(|a| format!(" [held to the {} capacity; analysis {:.1} kN]", a, r.v_model)).unwrap_or_default()
             );
         }
         println!("({:?})", t.elapsed());
@@ -171,6 +173,25 @@ fn main() -> eframe::Result<()> {
                 println!("    {}", n);
             }
         }
+        return Ok(());
+    }
+    if args.len() >= 3 && args[1] == "--bench-sym" {
+        bench::run_sym(&args[2], args.get(3).and_then(|s| s.parse().ok()).unwrap_or(20));
+        return Ok(());
+    }
+    if args.len() >= 5 && args[1] == "--bench-sweep" {
+        bench::run_sweep(&args[2], args[3].parse().unwrap_or(0.2), args[4].parse().unwrap_or(10), args.get(5).and_then(|s| s.parse().ok()));
+        return Ok(());
+    }
+    if args.len() >= 5 && args[1] == "--check-shares" {
+        bench::run_share_check(&args[2], args[3].parse().unwrap_or(0.0), args[4].parse().unwrap_or(100.0), args.get(5).and_then(|s| s.parse().ok()));
+        return Ok(());
+    }
+    if args.len() >= 2 && args[1] == "--bench-mv" {
+        // --bench-mv [points a side] [files...]: time, symmetry and smoothness of M-V diagrams
+        let pts = args.get(2).and_then(|s| s.parse().ok());
+        let from = if pts.is_some() { 3 } else { 2 };
+        bench::run(&args[from.min(args.len())..], pts.unwrap_or(20));
         return Ok(());
     }
     if args.len() >= 2 && args[1] == "--check-mechanics" {

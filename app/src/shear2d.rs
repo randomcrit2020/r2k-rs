@@ -14,6 +14,8 @@
 //!   has 2 and 2 legs, an open one 2 and 1, a single leg 1 and 0); a hoop is the same in every
 //!   direction; the tie's height range is its turned outline's;
 //! * theta = 0 is the section itself, unchanged.
+//! Every direction is solved on its own (no half is mirrored). Each is then limited so that
+//! neither component exceeds the capacity along its own axis (see `diagram`).
 //! The capacity at each direction is the peak shear of that run; the Vx-Vy diagram is the peaks
 //! at evenly spaced directions.
 
@@ -31,6 +33,11 @@ pub struct VRun {
     pub reason: String,
     /// effective tie area in this direction (mm2, all legs)
     pub av: f64,
+    /// the capacity the turned-section analysis gave before the limit of `diagram` (kN); the
+    /// same as `v` where the limit did not bind
+    pub v_model: f64,
+    /// which axis capacity limits this direction, if one does: "sideways" or "vertical"
+    pub limited: Option<&'static str>,
 }
 
 impl VRun {
@@ -224,40 +231,92 @@ pub fn rotated_section(sec: &Section, theta_deg: f64) -> (Section, f64, Vec<TieL
 pub fn run(sec: &Section, theta_deg: f64, n: f64, mv: f64) -> VRun {
     let (mut s, av, lines) = rotated_section(sec, theta_deg);
     s.loads = Loads::new(n, mv, false);
-    let fail = |reason: String| VRun { theta: theta_deg, v: 0.0, m: 0.0, mech: None, reason, av };
+    let fail = |reason: String| VRun { theta: theta_deg, v: 0.0, m: 0.0, mech: None, reason, av, v_model: 0.0, limited: None };
     let Ok(mut m) = analysis::build_shear(&s) else { return fail("The turned section could not be built.".into()) };
-    // a turned rectangular tie: each layer's tie ratio from the sides it crosses
+    // a turned rectangular tie: each layer's tie ratio from the sides crossed around its height.
+    // Taken at the layer's own height alone, a thin band can get far less than its neighbours:
+    // a 350 x 650 tie turned 60 degrees has 22 mm at mid-depth where a cut meets its two long
+    // sides, steeply inclined (300 mm2 against 410 either side), and with the shear stress
+    // largest there that one layer set the capacity (450 x 750 column: 1065 kN at 60 degrees,
+    // 1100 at 65). Ties are bars one spacing apart along the member, and a diagonal crack
+    // meets them over a height of about that spacing, so the area is averaged over a window
+    // of one spacing (at most a quarter of the depth), kept inside the tie's own height.
+    // SR_TIE_POINT=1: at the layer's height alone.
     if !lines.is_empty() {
         let sp = s.stirrups.as_ref().map(|st| st.spacing).unwrap_or(1.0).max(1.0);
         for ly in m.layers.iter_mut() {
-            ly.rho_z = if ly.b > 0.0 { tie_area_at(&lines, ly.z) / (ly.b * sp) } else { 0.0 };
+            let lo = lines.iter().map(|l| l.0 .1.min(l.1 .1)).fold(f64::INFINITY, f64::min);
+            let hi = lines.iter().map(|l| l.0 .1.max(l.1 .1)).fold(f64::NEG_INFINITY, f64::max);
+            let area = if ly.z <= lo || ly.z >= hi || std::env::var("SR_TIE_POINT").is_ok() {
+                tie_area_at(&lines, ly.z)
+            } else {
+                let half = 0.5 * sp.min(0.25 * m.h);
+                let (a, b) = ((ly.z - half).max(lo), (ly.z + half).min(hi));
+                let n = 16;
+                (0..n).map(|k| tie_area_at(&lines, a + (b - a) * (k as f64 + 0.5) / n as f64)).sum::<f64>() / n as f64
+            };
+            ly.rho_z = if ly.b > 0.0 { area / (ly.b * sp) } else { 0.0 };
         }
     }
     let mp = analysis::moment_curvature(&m, n);
     let (cc, d) = s.loads.model_spec();
     let r = analysis::sectional_response(&m, cc, d, &mp);
     match r.points.iter().max_by(|a, b| a.v.partial_cmp(&b.v).unwrap()) {
-        Some(p) => VRun { theta: theta_deg, v: p.v, m: p.m, mech: r.mech, reason: r.reason.clone(), av },
+        Some(p) => VRun { theta: theta_deg, v: p.v, m: p.m, mech: r.mech, reason: r.reason.clone(), av, v_model: p.v, limited: None },
         None => fail(r.reason.clone()),
     }
 }
 
 /// The Vx-Vy diagram: runs at `dirs` evenly spaced directions, in parallel.
 pub fn diagram(sec: &Section, n: f64, mv: f64, dirs: usize, progress: &(dyn Fn(f32) + Sync)) -> VDiagram {
-    // an even number of directions; the program's sections are symmetric about the vertical
-    // axis (outline and bar rows), so theta and 360 - theta are mirror images: only 0 to 180
-    // are run and the other half is mirrored (the shear solver can stop at slightly different
-    // loads on a mirror image, which would show as a lopsided diagram)
+    // an even number of directions, every one of them solved on its own. (The half from 180 to
+    // 360 degrees used to be copied from its mirror image, because the solver could stop at
+    // slightly different loads on the two; it no longer does, and solving both is the proof:
+    // a section symmetric about the vertical axis must come out the same on both sides.
+    // SR_V2D_MIRROR=1 copies the half as before.)
     let dirs = (dirs.clamp(4, 72) / 2) * 2;
-    let half: Vec<f64> = (0..=dirs / 2).map(|i| 360.0 * i as f64 / dirs as f64).collect();
+    let mirror = std::env::var("SR_V2D_MIRROR").is_ok();
+    let half: Vec<f64> = if mirror { (0..=dirs / 2).map(|i| 360.0 * i as f64 / dirs as f64).collect() } else { (0..dirs).map(|i| 360.0 * i as f64 / dirs as f64).collect() };
+    // SR_V2D_ONLY=theta: that one direction alone (for tracing with SR_PATH / SR_DEBUG)
+    let half: Vec<f64> = match std::env::var("SR_V2D_ONLY").ok().and_then(|v| v.parse::<f64>().ok()) {
+        Some(t) => vec![t],
+        None => half,
+    };
     // one worker per core (pool.rs)
     let first: Vec<VRun> = crate::pool::map(&half, None, &|&th| run(sec, th, n, mv), progress);
     let mut runs = first.clone();
     for r in first.iter().rev() {
-        if r.theta > 1e-9 && r.theta < 180.0 - 1e-9 {
+        if mirror && r.theta > 1e-9 && r.theta < 180.0 - 1e-9 {
             let mut m = r.clone();
             m.theta = 360.0 - r.theta;
             runs.push(m);
+        }
+    }
+    // No component of the shear may exceed the capacity along its own axis: |Vx| <= Vn at 90 (or
+    // 270) degrees and |Vy| <= Vn at 0 (or 180). A turned section is analysed with the shear
+    // stress averaged across each layer's width, corners and all, and just off the weak axis that
+    // average falls quickly while the largest stress does not (principal components superposed:
+    // 1.5 V / A at the centre at every angle), so the analysis gave a 450 x 750 column 1101.5 kN at
+    // 74 degrees - a sideways component of 1059.5 kN - against 984.5 kN straight sideways. Adding
+    // shear in one direction cannot raise the capacity in the other. The axis capacities are
+    // solved for directly when they are not among the directions. SR_V2D_NO_CAP=1 turns it off.
+    if std::env::var("SR_V2D_NO_CAP").is_err() && std::env::var("SR_V2D_ONLY").is_err() {
+        let axes = [0.0, 90.0, 180.0, 270.0];
+        let have = |runs: &[VRun], t: f64| runs.iter().find(|r| (r.theta - t).abs() < 1e-6).map(|r| r.v_model);
+        let missing: Vec<f64> = axes.iter().copied().filter(|t| have(&runs, *t).is_none()).collect();
+        let extra: Vec<VRun> = crate::pool::map(&missing, None, &|&th| run(sec, th, n, mv), &|_| {});
+        let axis: Vec<f64> = axes.iter().map(|t| have(&runs, *t).or_else(|| have(&extra, *t)).unwrap_or(0.0)).collect();
+        for r in runs.iter_mut() {
+            let (s, c) = (r.theta.to_radians().sin(), r.theta.to_radians().cos());
+            let (vx_lim, vy_lim) = (axis[if s >= 0.0 { 1 } else { 3 }], axis[if c >= 0.0 { 0 } else { 2 }]);
+            let by_x = if s.abs() > 1e-9 && vx_lim > 0.0 { vx_lim / s.abs() } else { f64::INFINITY };
+            let by_y = if c.abs() > 1e-9 && vy_lim > 0.0 { vy_lim / c.abs() } else { f64::INFINITY };
+            let lim = by_x.min(by_y);
+            if r.v > lim * (1.0 + 1e-9) {
+                r.m *= lim / r.v;
+                r.v = lim;
+                r.limited = Some(if by_x <= by_y { "sideways" } else { "vertical" });
+            }
         }
     }
     VDiagram { n, mv, runs }
